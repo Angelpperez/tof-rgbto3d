@@ -135,8 +135,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", type=Path, help="Guardar HTML.")
     p.add_argument("--no-show", action="store_true", help="No abrir visor.")
     p.add_argument("--flip-x", action="store_true", help="Invertir eje X.")
-    p.add_argument("--flip-y", action="store_true", help="Invertir eje Y.")
-    p.add_argument("--flip-z", action="store_true", help="Invertir eje Z.")
+    p.add_argument(
+        "--flip-y",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Invertir eje Y (default: True).",
+    )
+    p.add_argument(
+        "--flip-z",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Invertir eje Z (default: True).",
+    )
     p.add_argument("--auto-flip-z", action="store_true", help="Invierte Z si la mediana es negativa.")
     return p.parse_args()
 
