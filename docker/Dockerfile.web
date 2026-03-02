@@ -1,0 +1,6 @@
+FROM python:3.13-slim
+WORKDIR /app
+COPY services/web /app/services/web
+# TODO: agregar dependencias reales de FastHTML
+EXPOSE 8080
+CMD ["python", "services/web/app.py"]

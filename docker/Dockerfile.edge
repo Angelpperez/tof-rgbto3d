@@ -1,0 +1,5 @@
+FROM python:3.13-slim
+WORKDIR /app
+COPY services/edge-agent /app/services/edge-agent
+# TODO: agregar drivers/SDK de cámaras y dependencias
+CMD ["python", "services/edge-agent/agent.py"]

@@ -1,0 +1,6 @@
+FROM python:3.13-slim
+WORKDIR /app
+COPY services/api /app/services/api
+RUN pip install --no-cache-dir fastapi uvicorn
+EXPOSE 8000
+CMD ["uvicorn", "services.api.app:app", "--host", "0.0.0.0", "--port", "8000"]

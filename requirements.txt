@@ -1,0 +1,4 @@
+pypylon==4.2.0
+numpy
+opencv-python
+plotly

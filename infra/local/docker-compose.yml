@@ -1,0 +1,23 @@
+services:
+  api:
+    build:
+      context: ../../
+      dockerfile: docker/Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=local
+  web:
+    build:
+      context: ../../
+      dockerfile: docker/Dockerfile.web
+    ports:
+      - "8080:8080"
+    environment:
+      - APP_ENV=local
+  worker:
+    build:
+      context: ../../
+      dockerfile: docker/Dockerfile.worker
+    environment:
+      - APP_ENV=local

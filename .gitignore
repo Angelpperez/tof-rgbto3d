@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+
+# Env
+.env
+.venv3d/
+
+# IDE
+.vs/
+
+# Local captures / datasets
+captures/
+Dataset_*/
+DataSet_*/
+dataset_*/
+TOF CENITAL/
+
+# Screens / logs
+ScreenCapture_*.png
+ScreenCamera_*.json
