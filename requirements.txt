@@ -2,3 +2,9 @@ pypylon==4.2.0
 numpy
 opencv-python
 plotly
+open3d
+scikit-learn
+scipy
+pandas
+xgboost
+joblib
