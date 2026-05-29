@@ -9,6 +9,24 @@
 
 ---
 
+## Inicio rápido
+
+```powershell
+# 1. Permitir ejecución de scripts en esta sesión
+set-executionpolicy -scope process -executionpolicy bypass
+
+# 2. Activar entorno virtual
+.venv3d\Scripts\Activate.ps1
+
+# 3. Instalar dependencias
+pip install -r requirements.txt
+
+# 4. Ejecutar visor offline (sin cámara)
+py viewer_seg.py --offline "frames/*.npz"
+```
+
+---
+
 ## ¿Qué hace este proyecto?
 
 Detecta y segmenta morfologías de rocas en nubes de puntos 3D capturadas con una cámara **Basler blaze-101 ToF** en tiempo real, usando el pipeline de Machine Learning desarrollado en la tesis:
