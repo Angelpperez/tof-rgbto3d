@@ -4,6 +4,9 @@
 **Autor:** Angel Pérez Pérez — Universidad de Santiago de Chile (USACH)  
 **Directores:** Dr. Francisco Cubillos Montecino · Dr. John Kern Molina
 
+> Para entender en detalle el experimento ML, la metodología y los resultados completos, consultar la presentación:  
+> `docs/Tarea Angel Pérez Pérez.pptx`
+
 ---
 
 ## ¿Qué hace este proyecto?
