@@ -11,6 +11,8 @@
 
 ## Inicio rápido
 
+> **Requisito:** abrir una terminal **Windows PowerShell** (no CMD ni bash).
+
 ```powershell
 # 1. Permitir ejecución de scripts en esta sesión
 set-executionpolicy -scope process -executionpolicy bypass
@@ -24,6 +26,8 @@ pip install -r requirements.txt
 # 4. Ejecutar visor offline (sin cámara)
 py viewer_seg.py --offline "frames/*.npz"
 ```
+
+> Para detener el programa en cualquier momento presionar **Ctrl + C** en la terminal.
 
 ---
 
