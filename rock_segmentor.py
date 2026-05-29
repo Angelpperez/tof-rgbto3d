@@ -63,9 +63,10 @@ class SegConfig:
     outlier_std:   float = 2.0
 
     # RANSAC plano suelo
-    ransac_dist:   float = 0.05    # metros
-    ransac_n:      int   = 3
-    ransac_iter:   int   = 1000
+    ransac_dist:        float = 0.03    # metros — tolerancia al ajustar el plano
+    ransac_n:           int   = 3
+    ransac_iter:        int   = 1000
+    min_height_above:   float = 0.02    # metros — mínimo para ser "objeto" sobre el suelo
 
     # Submuestreo de objetos antes de DBSCAN
     max_object_pts: int  = 80_000
@@ -200,18 +201,31 @@ class RockSegmentor:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
 
-        _, inliers = pcd.segment_plane(
+        plane_model, _ = pcd.segment_plane(
             distance_threshold=self.cfg.ransac_dist,
             ransac_n=self.cfg.ransac_n,
             num_iterations=self.cfg.ransac_iter,
         )
-        inliers = np.asarray(inliers)
-        mask_obj = np.ones(len(pts), dtype=bool)
-        mask_obj[inliers] = False
 
-        ground_pts = pts[inliers]
+        # Distancia firmada de cada punto al plano ax+by+cz+d=0
+        # Positivo = por encima del plano (lado de la normal)
+        a, b, c, d = plane_model
+        norm = float(np.sqrt(a*a + b*b + c*c))
+        signed_dist = (pts @ np.array([a, b, c], dtype=np.float32) + d) / norm
+
+        # Si la normal apunta hacia abajo (suelo visto desde arriba), invertir signo
+        # para que "objeto sobre el suelo" tenga distancia positiva
+        if signed_dist.mean() < 0:
+            signed_dist = -signed_dist
+
+        mask_obj = signed_dist > self.cfg.min_height_above
+
+        ground_pts = pts[~mask_obj]
         object_pts = pts[mask_obj]
         obj_intens = intens[mask_obj] if intens is not None else None
+
+        log.debug("RANSAC: suelo=%d obj=%d (min_height=%.3fm)",
+                  ground_pts.shape[0], object_pts.shape[0], self.cfg.min_height_above)
 
         # Subsample si hay demasiados puntos de objetos
         if object_pts.shape[0] > self.cfg.max_object_pts:

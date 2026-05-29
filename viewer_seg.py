@@ -52,20 +52,21 @@ COLOR_NOISE  = np.array([0.10, 0.10, 0.10])
 SEG_EVERY = 5   # corre segmentación cada N frames capturados
 
 SEG_CFG = SegConfig(
-    conf_min       = 200,
-    outlier_nb     = 20,
-    outlier_std    = 2.0,
-    ransac_dist    = 0.05,
-    ransac_n       = 3,
-    ransac_iter    = 1000,
-    max_object_pts = 80_000,
-    dbscan_knn     = 15,
-    dbscan_eps_pct = 95.0,
-    dbscan_min_pts = 50,
-    prob_threshold = 0.5,
-    model_path     = "models/rock_classifier.joblib",
-    scaler_path    = "models/rock_scaler.joblib",
-    xyz_scale      = 0.001,
+    conf_min         = 200,
+    outlier_nb       = 20,
+    outlier_std      = 2.0,
+    ransac_dist      = 0.03,   # tolerancia al ajustar el plano suelo
+    ransac_n         = 3,
+    ransac_iter      = 1000,
+    min_height_above = 0.02,   # mínimo 2cm sobre el suelo para ser "objeto"
+    max_object_pts   = 80_000,
+    dbscan_knn       = 15,
+    dbscan_eps_pct   = 95.0,
+    dbscan_min_pts   = 50,
+    prob_threshold   = 0.5,
+    model_path       = "models/rock_classifier.joblib",
+    scaler_path      = "models/rock_scaler.joblib",
+    xyz_scale        = 0.001,
 )
 
 # ---------------------------------------------------------------------------
