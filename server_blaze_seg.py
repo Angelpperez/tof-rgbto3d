@@ -120,6 +120,10 @@ def build_points(xyz, depth_bgr, conf=None, stride=4, conf_min=0):
 
     return pts[valid], cols[valid]
 
+
+def _fmt_xyz(point: np.ndarray) -> str:
+    return f"({point[0]:.3f}, {point[1]:.3f}, {point[2]:.3f})"
+
 # ---------------------------------------------------------------------------
 # capture_loop
 # ---------------------------------------------------------------------------
@@ -218,10 +222,15 @@ def segmentation_loop() -> None:
             continue
 
         result = segmentor.process(xyz, conf, intens)
+        if result.clusters:
+            main_cluster = max(result.clusters, key=lambda c: c.n_points)
+            top_xyz = _fmt_xyz(main_cluster.top_face_center_view)
+        else:
+            top_xyz = "-"
 
         log.info(
-            "[SEG] prob_roca=%.3f | is_rock=%s | clusters=%d | %.1f ms",
-            result.prob_roca, result.is_rock, len(result.clusters), result.elapsed_ms
+            "[SEG] prob_roca=%.3f | is_rock=%s | clusters=%d | top_xyz=%s | %.1f ms",
+            result.prob_roca, result.is_rock, len(result.clusters), top_xyz, result.elapsed_ms
         )
 
         with LATEST["lock"]:

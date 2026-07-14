@@ -156,6 +156,70 @@ def _build_seg_cloud(result: SegResult):
     all_cols = np.vstack(col_list).astype(np.float64)
     return all_pts, all_cols
 
+
+def _fmt_xyz(point: np.ndarray) -> str:
+    return f"({point[0]:.3f}, {point[1]:.3f}, {point[2]:.3f})"
+
+
+def _fmt_xyz_label(point: np.ndarray) -> str:
+    return f"X={point[0]:.3f}\nY={point[1]:.3f}\nZ={point[2]:.3f}"
+
+
+_TEXT_SEGMENTS = {
+    "0": [((0, 0), (1, 0)), ((1, 0), (1, 2)), ((1, 2), (0, 2)), ((0, 2), (0, 0))],
+    "1": [((0.5, 0), (0.5, 2))],
+    "2": [((0, 2), (1, 2)), ((1, 2), (1, 1)), ((1, 1), (0, 1)), ((0, 1), (0, 0)), ((0, 0), (1, 0))],
+    "3": [((0, 2), (1, 2)), ((1, 2), (1, 0)), ((0, 1), (1, 1)), ((0, 0), (1, 0))],
+    "4": [((0, 2), (0, 1)), ((0, 1), (1, 1)), ((1, 2), (1, 0))],
+    "5": [((1, 2), (0, 2)), ((0, 2), (0, 1)), ((0, 1), (1, 1)), ((1, 1), (1, 0)), ((1, 0), (0, 0))],
+    "6": [((1, 2), (0, 2)), ((0, 2), (0, 0)), ((0, 0), (1, 0)), ((1, 0), (1, 1)), ((1, 1), (0, 1))],
+    "7": [((0, 2), (1, 2)), ((1, 2), (0.4, 0))],
+    "8": [((0, 0), (1, 0)), ((1, 0), (1, 2)), ((1, 2), (0, 2)), ((0, 2), (0, 0)), ((0, 1), (1, 1))],
+    "9": [((1, 0), (1, 2)), ((1, 2), (0, 2)), ((0, 2), (0, 1)), ((0, 1), (1, 1)), ((0, 0), (1, 0))],
+    "X": [((0, 0), (1, 2)), ((0, 2), (1, 0))],
+    "Y": [((0, 2), (0.5, 1)), ((1, 2), (0.5, 1)), ((0.5, 1), (0.5, 0))],
+    "Z": [((0, 2), (1, 2)), ((1, 2), (0, 0)), ((0, 0), (1, 0))],
+    "=": [((0.1, 1.25), (0.9, 1.25)), ((0.1, 0.75), (0.9, 0.75))],
+    "-": [((0.15, 1), (0.85, 1))],
+    ".": [((0.45, 0), (0.55, 0))],
+}
+
+
+def _make_text_label(
+    text: str,
+    origin: np.ndarray,
+    scale: float = 0.012,
+    color: tuple[float, float, float] = (1.0, 0.95, 0.05),
+) -> o3d.geometry.LineSet:
+    points, lines, colors = [], [], []
+    cursor_x = 0.0
+    cursor_y = 0.0
+    advance = 1.45
+    line_gap = 2.65
+
+    for ch in text:
+        if ch == "\n":
+            cursor_x = 0.0
+            cursor_y -= line_gap
+            continue
+        if ch == " ":
+            cursor_x += advance
+            continue
+
+        for p0, p1 in _TEXT_SEGMENTS.get(ch, []):
+            start = origin + np.array([(cursor_x + p0[0]) * scale, (cursor_y + p0[1]) * scale, 0.0])
+            end = origin + np.array([(cursor_x + p1[0]) * scale, (cursor_y + p1[1]) * scale, 0.0])
+            lines.append([len(points), len(points) + 1])
+            points.extend([start, end])
+            colors.append(color)
+        cursor_x += advance
+
+    label = o3d.geometry.LineSet()
+    label.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+    label.lines = o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32))
+    label.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=np.float64))
+    return label
+
 # ---------------------------------------------------------------------------
 # capture_loop — hilo de fondo
 # ---------------------------------------------------------------------------
@@ -243,8 +307,14 @@ def seg_loop(segmentor: RockSegmentor) -> None:
             continue
 
         result = segmentor.process(xyz, conf, intens)
-        log.info("[SEG] prob=%.3f | rock=%s | clusters=%d | %.0fms",
-                 result.prob_roca, result.is_rock, len(result.clusters), result.elapsed_ms)
+        if result.clusters:
+            main_cluster = max(result.clusters, key=lambda c: c.n_points)
+            top_xyz = _fmt_xyz(main_cluster.top_face_center_view)
+        else:
+            top_xyz = "-"
+
+        log.info("[SEG] prob=%.3f | rock=%s | clusters=%d | top_xyz=%s | %.0fms",
+                 result.prob_roca, result.is_rock, len(result.clusters), top_xyz, result.elapsed_ms)
 
         with LATEST["lock"]:
             LATEST["seg"] = result
@@ -322,6 +392,7 @@ def main(offline: str | None = None) -> None:
 
     # OBBs activos en el visualizador
     active_obbs: list = []
+    active_top_markers: list = []
 
     first_reset  = True
     last_seg_ts  = 0.0
@@ -371,7 +442,11 @@ def main(offline: str | None = None) -> None:
                 for obb in active_obbs:
                     vis.remove_geometry(obb, reset_bounding_box=False)
                 active_obbs.clear()
+                for marker in active_top_markers:
+                    vis.remove_geometry(marker, reset_bounding_box=False)
+                active_top_markers.clear()
 
+                main_cluster = max(seg.clusters, key=lambda c: c.n_points) if seg.clusters else None
                 for i, c in enumerate(seg.clusters):
                     try:
                         center = c.obb_center.copy().astype(np.float64)
@@ -384,6 +459,19 @@ def main(offline: str | None = None) -> None:
                         obb.color = PALETTE[i % len(PALETTE)]
                         vis.add_geometry(obb, reset_bounding_box=False)
                         active_obbs.append(obb)
+
+                        if c is main_cluster:
+                            marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.008)
+                            marker.compute_vertex_normals()
+                            marker.paint_uniform_color([1.0, 0.05, 0.05])
+                            marker.translate(c.top_face_center_view.astype(np.float64))
+                            vis.add_geometry(marker, reset_bounding_box=False)
+                            active_top_markers.append(marker)
+
+                            label_origin = c.top_face_center_view.astype(np.float64) + np.array([0.020, 0.025, 0.0])
+                            label = _make_text_label(_fmt_xyz_label(c.top_face_center_view), label_origin)
+                            vis.add_geometry(label, reset_bounding_box=False)
+                            active_top_markers.append(label)
                     except Exception as e:
                         log.warning("OBB %d error: %s", i, e)
 

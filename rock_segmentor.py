@@ -32,9 +32,11 @@ class RockCluster:
     prob_roca:   float
     n_points:    int
     obb_center:  np.ndarray          # (3,) float32
-    obb_extent:  np.ndarray          # (3,) float32 — semiejes
+    obb_extent:  np.ndarray          # (3,) float32
     obb_corners: np.ndarray          # (8,3) float32
     obb_R:       np.ndarray          # (3,3) float32 — rotación
+    top_face_center:      np.ndarray # (3,) float32, coord. camara, arriba = -Y
+    top_face_center_view: np.ndarray # (3,) float32, coord. visor, arriba = +Y
 
 
 @dataclass
@@ -332,6 +334,8 @@ class RockSegmentor:
                 center  = np.asarray(obb.center, dtype=np.float32)
                 extent  = np.asarray(obb.extent, dtype=np.float32)
                 R       = np.asarray(obb.R, dtype=np.float32)
+                top_center = self._top_face_center(center, extent, R)
+                top_center_view = self._flip_y_point(top_center)
             except Exception:
                 continue
 
@@ -343,6 +347,38 @@ class RockSegmentor:
                 obb_extent  = extent,
                 obb_corners = corners,
                 obb_R       = R,
+                top_face_center      = top_center,
+                top_face_center_view = top_center_view,
             ))
 
         return clusters, labels
+
+    @staticmethod
+    def _top_face_center(
+        center: np.ndarray,
+        extent: np.ndarray,
+        R: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Centro de la cara superior del OBB.
+
+        En la camara Basler/OpenCV el eje Y crece hacia abajo, por eso la
+        direccion fisica "arriba" es -Y. Open3D devuelve extent como largo
+        completo por eje, asi que se avanza extent/2 desde el centro.
+        """
+        camera_up = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+        axes = R.astype(np.float32)
+        dots = axes.T @ camera_up
+        axis_idx = int(np.argmax(np.abs(dots)))
+
+        top_normal = axes[:, axis_idx]
+        if dots[axis_idx] < 0:
+            top_normal = -top_normal
+
+        return (center + top_normal * (float(extent[axis_idx]) * 0.5)).astype(np.float32)
+
+    @staticmethod
+    def _flip_y_point(point: np.ndarray) -> np.ndarray:
+        out = point.astype(np.float32).copy()
+        out[1] = -out[1]
+        return out
