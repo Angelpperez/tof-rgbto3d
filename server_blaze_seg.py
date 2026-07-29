@@ -19,6 +19,7 @@ import open3d as o3d
 from pypylon import pylon
 
 from rock_segmentor import RockSegmentor, SegConfig, SegResult
+from simulink_udp import SimulinkUdpSender
 
 logging.basicConfig(
     level=logging.INFO,
@@ -204,6 +205,7 @@ def capture_loop() -> None:
 
 def segmentation_loop() -> None:
     segmentor  = RockSegmentor(SEG_CFG)
+    simulink_sender = SimulinkUdpSender.from_env()
     frame_cnt  = 0
 
     while True:
@@ -225,6 +227,7 @@ def segmentation_loop() -> None:
         if result.clusters:
             main_cluster = result.clusters[0]
             top_xyz = _fmt_xyz(main_cluster.top_face_center)
+            simulink_sender.send_xyz(main_cluster.top_face_center, result.tracking_status)
         else:
             top_xyz = "-"
 
