@@ -223,14 +223,15 @@ def segmentation_loop() -> None:
 
         result = segmentor.process(xyz, conf, intens)
         if result.clusters:
-            main_cluster = max(result.clusters, key=lambda c: c.n_points)
-            top_xyz = _fmt_xyz(main_cluster.top_face_center_view)
+            main_cluster = result.clusters[0]
+            top_xyz = _fmt_xyz(main_cluster.top_face_center)
         else:
             top_xyz = "-"
 
         log.info(
-            "[SEG] prob_roca=%.3f | is_rock=%s | clusters=%d | top_xyz=%s | %.1f ms",
-            result.prob_roca, result.is_rock, len(result.clusters), top_xyz, result.elapsed_ms
+            "[SEG] prob_roca=%.3f | is_rock=%s | clusters=%d | track=%s | top_xyz_cam=%s | %.1f ms",
+            result.prob_roca, result.is_rock, len(result.clusters),
+            result.tracking_status, top_xyz, result.elapsed_ms
         )
 
         with LATEST["lock"]:

@@ -48,6 +48,16 @@ PALETTE = np.array([
 
 COLOR_GROUND = np.array([0.30, 0.30, 0.30])
 COLOR_NOISE  = np.array([0.10, 0.10, 0.10])
+COLOR_OTHER_OBJECT = np.array([0.18, 0.18, 0.18])
+COLOR_CYAN_CORE = np.array([0.00, 0.85, 1.00])
+COLOR_LABEL = np.array([1.00, 0.86, 0.05])
+COLOR_MARKER = np.array([1.00, 0.08, 0.05])
+
+OBB_EDGES = [
+    (0, 1), (1, 2), (2, 3), (3, 0),
+    (4, 5), (5, 6), (6, 7), (7, 4),
+    (0, 4), (1, 5), (2, 6), (3, 7),
+]
 
 SEG_EVERY = 5   # corre segmentación cada N frames capturados
 
@@ -137,7 +147,7 @@ def _build_seg_cloud(result: SegResult):
         labels = result.object_labels
 
         if labels is not None:
-            cols = np.zeros((op.shape[0], 3), dtype=np.float64)
+            cols = np.tile(COLOR_OTHER_OBJECT, (op.shape[0], 1))
             for i, c in enumerate(result.clusters):
                 mask = labels == c.cluster_id
                 cols[mask] = PALETTE[i % len(PALETTE)]
@@ -179,7 +189,15 @@ _TEXT_SEGMENTS = {
     "X": [((0, 0), (1, 2)), ((0, 2), (1, 0))],
     "Y": [((0, 2), (0.5, 1)), ((1, 2), (0.5, 1)), ((0.5, 1), (0.5, 0))],
     "Z": [((0, 2), (1, 2)), ((1, 2), (0, 0)), ((0, 0), (1, 0))],
+    "C": [((1, 2), (0, 2)), ((0, 2), (0, 0)), ((0, 0), (1, 0))],
+    "H": [((0, 0), (0, 2)), ((1, 0), (1, 2)), ((0, 1), (1, 1))],
+    "K": [((0, 0), (0, 2)), ((0, 1), (1, 2)), ((0, 1), (1, 0))],
+    "L": [((0, 2), (0, 0)), ((0, 0), (1, 0))],
+    "O": [((0, 0), (1, 0)), ((1, 0), (1, 2)), ((1, 2), (0, 2)), ((0, 2), (0, 0))],
+    "R": [((0, 0), (0, 2)), ((0, 2), (1, 2)), ((1, 2), (1, 1)), ((1, 1), (0, 1)), ((0, 1), (1, 0))],
+    "W": [((0, 2), (0.2, 0)), ((0.2, 0), (0.5, 0.8)), ((0.5, 0.8), (0.8, 0)), ((0.8, 0), (1, 2))],
     "=": [((0.1, 1.25), (0.9, 1.25)), ((0.1, 0.75), (0.9, 0.75))],
+    ":": [((0.5, 1.35), (0.5, 1.45)), ((0.5, 0.55), (0.5, 0.65))],
     "-": [((0.15, 1), (0.85, 1))],
     ".": [((0.45, 0), (0.55, 0))],
 }
@@ -190,25 +208,38 @@ def _make_text_label(
     origin: np.ndarray,
     scale: float = 0.012,
     color: tuple[float, float, float] = (1.0, 0.95, 0.05),
+    mirror_x: bool = False,
 ) -> o3d.geometry.LineSet:
     points, lines, colors = [], [], []
-    cursor_x = 0.0
-    cursor_y = 0.0
     advance = 1.45
     line_gap = 2.65
+    line_widths = [
+        sum(advance if ch != " " else advance for ch in line)
+        for line in text.split("\n")
+    ]
+    cursor_x = 0.0
+    cursor_y = 0.0
+    line_idx = 0
 
     for ch in text:
         if ch == "\n":
             cursor_x = 0.0
             cursor_y -= line_gap
+            line_idx += 1
             continue
         if ch == " ":
             cursor_x += advance
             continue
 
         for p0, p1 in _TEXT_SEGMENTS.get(ch, []):
-            start = origin + np.array([(cursor_x + p0[0]) * scale, (cursor_y + p0[1]) * scale, 0.0])
-            end = origin + np.array([(cursor_x + p1[0]) * scale, (cursor_y + p1[1]) * scale, 0.0])
+            x0 = cursor_x + p0[0]
+            x1 = cursor_x + p1[0]
+            if mirror_x:
+                width = line_widths[line_idx]
+                x0 = width - x0
+                x1 = width - x1
+            start = origin + np.array([x0 * scale, (cursor_y + p0[1]) * scale, 0.0])
+            end = origin + np.array([x1 * scale, (cursor_y + p1[1]) * scale, 0.0])
             lines.append([len(points), len(points) + 1])
             points.extend([start, end])
             colors.append(color)
@@ -219,6 +250,137 @@ def _make_text_label(
     label.lines = o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32))
     label.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=np.float64))
     return label
+
+
+def _to_display_point(point_cam: np.ndarray) -> np.ndarray:
+    out = point_cam.astype(np.float64).copy()
+    out[1] = -out[1]
+    return out
+
+
+def _to_display_points(points_cam: np.ndarray) -> np.ndarray:
+    out = points_cam.astype(np.float64).copy()
+    out[:, 1] = -out[:, 1]
+    return out
+
+
+def _rotation_from_z(direction: np.ndarray) -> np.ndarray:
+    target = direction.astype(np.float64)
+    norm = float(np.linalg.norm(target))
+    if norm < 1e-9:
+        return np.eye(3)
+    target /= norm
+    source = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    cross = np.cross(source, target)
+    dot = float(np.clip(source @ target, -1.0, 1.0))
+    s = float(np.linalg.norm(cross))
+    if s < 1e-9:
+        return np.eye(3) if dot > 0 else np.diag([1.0, -1.0, -1.0])
+    k = np.array([
+        [0.0, -cross[2], cross[1]],
+        [cross[2], 0.0, -cross[0]],
+        [-cross[1], cross[0], 0.0],
+    ])
+    return np.eye(3) + k + k @ k * ((1.0 - dot) / (s * s))
+
+
+def _make_cylinder_between(
+    start: np.ndarray,
+    end: np.ndarray,
+    radius: float,
+    color: np.ndarray,
+    resolution: int = 10,
+) -> o3d.geometry.TriangleMesh:
+    start = start.astype(np.float64)
+    end = end.astype(np.float64)
+    vec = end - start
+    length = float(np.linalg.norm(vec))
+    if length < 1e-6:
+        mesh = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+        mesh.translate(start)
+    else:
+        mesh = o3d.geometry.TriangleMesh.create_cylinder(
+            radius=radius,
+            height=length,
+            resolution=resolution,
+            split=1,
+        )
+        mesh.rotate(_rotation_from_z(vec), center=np.zeros(3))
+        mesh.translate((start + end) * 0.5)
+    mesh.paint_uniform_color(color.astype(np.float64))
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def _combine_meshes(meshes: list[o3d.geometry.TriangleMesh]) -> o3d.geometry.TriangleMesh:
+    combined = o3d.geometry.TriangleMesh()
+    for mesh in meshes:
+        combined += mesh
+    combined.compute_vertex_normals()
+    return combined
+
+
+def _make_obb_lines(
+    corners: np.ndarray,
+    color: np.ndarray = COLOR_CYAN_CORE,
+) -> o3d.geometry.LineSet:
+    line_set = o3d.geometry.LineSet()
+    line_set.points = o3d.utility.Vector3dVector(corners.astype(np.float64))
+    line_set.lines = o3d.utility.Vector2iVector(np.asarray(OBB_EDGES, dtype=np.int32))
+    line_set.colors = o3d.utility.Vector3dVector(
+        np.tile(color.astype(np.float64), (len(OBB_EDGES), 1))
+    )
+    return line_set
+
+
+def _make_arrow(
+    start: np.ndarray,
+    end: np.ndarray,
+    color: np.ndarray,
+    radius: float = 0.002,
+) -> o3d.geometry.TriangleMesh:
+    start = start.astype(np.float64)
+    end = end.astype(np.float64)
+    vec = end - start
+    length = float(np.linalg.norm(vec))
+    if length < 1e-6:
+        return o3d.geometry.TriangleMesh()
+
+    direction = vec / length
+    ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    if abs(float(ref @ direction)) > 0.85:
+        ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    side = np.cross(direction, ref)
+    side /= max(float(np.linalg.norm(side)), 1e-6)
+
+    head_len = min(0.055, max(0.025, length * 0.18))
+    head_w = head_len * 0.45
+    shaft_end = end - direction * (head_len * 0.45)
+    head_a = end - direction * head_len + side * head_w
+    head_b = end - direction * head_len - side * head_w
+
+    return _combine_meshes([
+        _make_cylinder_between(start, shaft_end, radius, color, resolution=8),
+        _make_cylinder_between(head_a, end, radius * 1.2, color, resolution=8),
+        _make_cylinder_between(head_b, end, radius * 1.2, color, resolution=8),
+    ])
+
+
+def _fmt_dimensions_label(extent: np.ndarray) -> str:
+    length = float(max(extent[0], extent[1]))
+    width = float(min(extent[0], extent[1]))
+    height = float(extent[2])
+    return f"L={length:.3f}\nW={width:.3f}\nH={height:.3f}"
+
+
+def _add_scene_geometries(
+    vis: o3d.visualization.Visualizer,
+    geometries: list,
+    active: list,
+) -> None:
+    for geom in geometries:
+        vis.add_geometry(geom, reset_bounding_box=False)
+        active.append(geom)
 
 # ---------------------------------------------------------------------------
 # capture_loop — hilo de fondo
@@ -308,13 +470,14 @@ def seg_loop(segmentor: RockSegmentor) -> None:
 
         result = segmentor.process(xyz, conf, intens)
         if result.clusters:
-            main_cluster = max(result.clusters, key=lambda c: c.n_points)
-            top_xyz = _fmt_xyz(main_cluster.top_face_center_view)
+            main_cluster = result.clusters[0]
+            top_xyz = _fmt_xyz(main_cluster.top_face_center)
         else:
             top_xyz = "-"
 
-        log.info("[SEG] prob=%.3f | rock=%s | clusters=%d | top_xyz=%s | %.0fms",
-                 result.prob_roca, result.is_rock, len(result.clusters), top_xyz, result.elapsed_ms)
+        log.info("[SEG] prob=%.3f | rock=%s | clusters=%d | track=%s | top_xyz_cam=%s | %.0fms",
+                 result.prob_roca, result.is_rock, len(result.clusters),
+                 result.tracking_status, top_xyz, result.elapsed_ms)
 
         with LATEST["lock"]:
             LATEST["seg"] = result
@@ -392,7 +555,7 @@ def main(offline: str | None = None) -> None:
 
     # OBBs activos en el visualizador
     active_obbs: list = []
-    active_top_markers: list = []
+    active_annotations: list = []
 
     first_reset  = True
     last_seg_ts  = 0.0
@@ -442,36 +605,73 @@ def main(offline: str | None = None) -> None:
                 for obb in active_obbs:
                     vis.remove_geometry(obb, reset_bounding_box=False)
                 active_obbs.clear()
-                for marker in active_top_markers:
+                for marker in active_annotations:
                     vis.remove_geometry(marker, reset_bounding_box=False)
-                active_top_markers.clear()
+                active_annotations.clear()
 
-                main_cluster = max(seg.clusters, key=lambda c: c.n_points) if seg.clusters else None
                 for i, c in enumerate(seg.clusters):
                     try:
-                        center = c.obb_center.copy().astype(np.float64)
-                        center[1] = -center[1]   # flip Y igual que la nube
-                        obb = o3d.geometry.OrientedBoundingBox(
-                            center=center,
-                            R=c.obb_R.astype(np.float64),
-                            extent=c.obb_extent.astype(np.float64),
+                        corners = _to_display_points(c.obb_corners)
+                        box_min = corners.min(axis=0)
+                        box_max = corners.max(axis=0)
+                        top_point = c.top_face_center_view.astype(np.float64)
+                        max_extent = max(float(np.max(c.obb_extent)), 1e-6)
+                        label_scale = float(np.clip(max_extent * 0.014, 0.007, 0.013))
+
+                        obb_lines = _make_obb_lines(corners)
+                        _add_scene_geometries(vis, [obb_lines], active_obbs)
+
+                        marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.008)
+                        marker.compute_vertex_normals()
+                        marker.paint_uniform_color(COLOR_MARKER.astype(np.float64))
+                        marker.translate(top_point)
+
+                        rock_label_origin = top_point + np.array([0.18, 0.16, 0.05])
+                        rock_label = _make_text_label(
+                            "ROCK",
+                            rock_label_origin,
+                            scale=label_scale * 0.95,
+                            color=tuple(COLOR_LABEL),
+                            mirror_x=True,
                         )
-                        obb.color = PALETTE[i % len(PALETTE)]
-                        vis.add_geometry(obb, reset_bounding_box=False)
-                        active_obbs.append(obb)
+                        arrow = _make_arrow(
+                            rock_label_origin + np.array([-0.015, -0.020, 0.0]),
+                            top_point,
+                            COLOR_CYAN_CORE,
+                            radius=0.0018,
+                        )
 
-                        if c is main_cluster:
-                            marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.008)
-                            marker.compute_vertex_normals()
-                            marker.paint_uniform_color([1.0, 0.05, 0.05])
-                            marker.translate(c.top_face_center_view.astype(np.float64))
-                            vis.add_geometry(marker, reset_bounding_box=False)
-                            active_top_markers.append(marker)
+                        xyz_origin = np.array([
+                            box_min[0] - max_extent * 0.30,
+                            box_max[1] + max_extent * 0.08,
+                            top_point[2],
+                        ])
+                        xyz_label = _make_text_label(
+                            _fmt_xyz_label(c.top_face_center),
+                            xyz_origin,
+                            scale=label_scale,
+                            color=tuple(COLOR_LABEL),
+                            mirror_x=True,
+                        )
 
-                            label_origin = c.top_face_center_view.astype(np.float64) + np.array([0.020, 0.025, 0.0])
-                            label = _make_text_label(_fmt_xyz_label(c.top_face_center_view), label_origin)
-                            vis.add_geometry(label, reset_bounding_box=False)
-                            active_top_markers.append(label)
+                        dim_origin = np.array([
+                            box_max[0] + max_extent * 0.08,
+                            box_max[1] - max_extent * 0.02,
+                            top_point[2],
+                        ])
+                        dim_label = _make_text_label(
+                            _fmt_dimensions_label(c.obb_extent),
+                            dim_origin,
+                            scale=label_scale,
+                            color=tuple(COLOR_LABEL),
+                            mirror_x=True,
+                        )
+
+                        _add_scene_geometries(
+                            vis,
+                            [marker, arrow, rock_label, xyz_label, dim_label],
+                            active_annotations,
+                        )
                     except Exception as e:
                         log.warning("OBB %d error: %s", i, e)
 

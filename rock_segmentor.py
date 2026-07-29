@@ -31,12 +31,20 @@ class RockCluster:
     cluster_id:  int
     prob_roca:   float
     n_points:    int
+    centroid:    np.ndarray          # (3,) float32, coord. camara
+    centroid_view: np.ndarray        # (3,) float32, coord. visor
+    base_center: np.ndarray          # (3,) float32, centro en plano suelo
+    base_center_view: np.ndarray     # (3,) float32, coord. visor
+    height_above_ground: float
     obb_center:  np.ndarray          # (3,) float32
     obb_extent:  np.ndarray          # (3,) float32
     obb_corners: np.ndarray          # (8,3) float32
     obb_R:       np.ndarray          # (3,3) float32 — rotación
-    top_face_center:      np.ndarray # (3,) float32, coord. camara, arriba = -Y
-    top_face_center_view: np.ndarray # (3,) float32, coord. visor, arriba = +Y
+    top_face_center:      np.ndarray # (3,) float32, base + normal suelo * altura
+    top_face_center_view: np.ndarray # (3,) float32, coord. visor
+    candidate_score: float = 0.0
+    tracking_status: str = "selected"
+    match_distance: float = 0.0
 
 
 @dataclass
@@ -49,6 +57,7 @@ class SegResult:
     object_labels: Optional[np.ndarray] = None   # (M,) int — label DBSCAN por punto (-1=ruido)
     clusters:      List[RockCluster] = field(default_factory=list)
     elapsed_ms:    float = 0.0
+    tracking_status: str = "none"
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +85,20 @@ class SegConfig:
     # DBSCAN
     dbscan_knn:       int   = 15    # vecinos para estimar eps
     dbscan_eps_pct:   float = 95.0  # percentil de distancias k-NN
+    dbscan_eps_min:   float = 0.03
     dbscan_min_pts:   int   = 50
+
+    # Tracking temporal: evita saltar al picaroca/pierna cuando entra en escena
+    tracking_enabled: bool = True
+    track_max_center_jump: float = 0.35
+    track_max_extent_ratio: float = 2.5
+    track_hold_frames: int = 90
+
+    # Priors geometricos para preferir rocas y penalizar intrusos largos/altos
+    rock_min_height: float = 0.03
+    rock_max_height: float = 1.30
+    rock_max_aspect: float = 12.0
+    rock_max_footprint: float = 2.50
 
     # Umbral de clasificación
     prob_threshold: float = 0.5
@@ -98,6 +120,8 @@ class RockSegmentor:
         self.cfg = cfg
         self._clf    = None
         self._scaler = None
+        self._last_cluster: Optional[RockCluster] = None
+        self._missed_track_frames = 0
         self._load_model()
 
     def _load_model(self) -> None:
@@ -131,7 +155,9 @@ class RockSegmentor:
         pts, intens_vals = self._remove_outliers(pts, intens_vals)
 
         # 3. RANSAC — separar suelo de objetos
-        ground_pts, object_pts, obj_intens = self._ransac_ground(pts, intens_vals)
+        ground_pts, object_pts, obj_intens, obj_heights, ground_normal = self._ransac_ground(
+            pts, intens_vals
+        )
 
         # 4. Features globales (sobre puntos de objetos)
         feats = self._compute_features(object_pts, obj_intens)
@@ -143,8 +169,14 @@ class RockSegmentor:
         # 6. DBSCAN solo si es nube de roca
         clusters: List[RockCluster] = []
         object_labels: Optional[np.ndarray] = None
+        tracking_status = "not_rock"
         if is_rock and object_pts.shape[0] >= cfg.dbscan_min_pts:
-            clusters, object_labels = self._dbscan_and_obb(object_pts, prob_roca)
+            clusters, object_labels, tracking_status = self._dbscan_and_obb(
+                object_pts, obj_heights, ground_normal, prob_roca
+            )
+        elif cfg.tracking_enabled and self._last_cluster is not None:
+            selected, tracking_status = self._select_tracked_cluster([])
+            clusters = [selected] if selected is not None else []
 
         elapsed = (time.perf_counter() - t0) * 1000
         return SegResult(
@@ -156,6 +188,7 @@ class RockSegmentor:
             object_labels = object_labels,
             clusters      = clusters,
             elapsed_ms    = elapsed,
+            tracking_status = tracking_status,
         )
 
     # ------------------------------------------------------------------
@@ -199,7 +232,7 @@ class RockSegmentor:
         self,
         pts:    np.ndarray,
         intens: Optional[np.ndarray],
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray, np.ndarray]:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
 
@@ -213,11 +246,12 @@ class RockSegmentor:
         # Positivo = por encima del plano (lado de la normal)
         a, b, c, d = plane_model
         norm = float(np.sqrt(a*a + b*b + c*c))
-        signed_dist = (pts @ np.array([a, b, c], dtype=np.float32) + d) / norm
-
-        # Si la normal apunta hacia abajo (suelo visto desde arriba), invertir signo
-        # para que "objeto sobre el suelo" tenga distancia positiva
+        ground_normal = np.array([a, b, c], dtype=np.float32) / norm
+        plane_offset = float(d) / norm
+        signed_dist = pts @ ground_normal + plane_offset
         if signed_dist.mean() < 0:
+            ground_normal = -ground_normal
+            plane_offset = -plane_offset
             signed_dist = -signed_dist
 
         mask_obj = signed_dist > self.cfg.min_height_above
@@ -225,6 +259,7 @@ class RockSegmentor:
         ground_pts = pts[~mask_obj]
         object_pts = pts[mask_obj]
         obj_intens = intens[mask_obj] if intens is not None else None
+        obj_heights = signed_dist[mask_obj].astype(np.float32)
 
         log.debug("RANSAC: suelo=%d obj=%d (min_height=%.3fm)",
                   ground_pts.shape[0], object_pts.shape[0], self.cfg.min_height_above)
@@ -233,10 +268,11 @@ class RockSegmentor:
         if object_pts.shape[0] > self.cfg.max_object_pts:
             idx = np.random.choice(object_pts.shape[0], self.cfg.max_object_pts, replace=False)
             object_pts = object_pts[idx]
+            obj_heights = obj_heights[idx]
             if obj_intens is not None:
                 obj_intens = obj_intens[idx]
 
-        return ground_pts, object_pts, obj_intens
+        return ground_pts, object_pts, obj_intens, obj_heights, ground_normal
 
     def _compute_features(
         self,
@@ -297,9 +333,11 @@ class RockSegmentor:
     def _dbscan_and_obb(
         self,
         object_pts: np.ndarray,
+        object_heights: np.ndarray,
+        ground_normal: np.ndarray,
         prob_roca:  float,
-    ) -> Tuple[List[RockCluster], np.ndarray]:
-        """Retorna (clusters, labels_por_punto) donde labels=-1 es ruido."""
+    ) -> Tuple[List[RockCluster], np.ndarray, str]:
+        """Retorna solo la roca trackeada y labels para todos los objetos."""
         cfg = self.cfg
 
         # Estimar eps desde percentil de distancias k-NN
@@ -307,7 +345,7 @@ class RockSegmentor:
         tree = KDTree(object_pts)
         dists, _ = tree.query(object_pts, k=k + 1)
         eps = float(np.percentile(dists[:, k], cfg.dbscan_eps_pct))
-        eps = max(eps, 0.01)   # mínimo 1 cm
+        eps = max(eps, cfg.dbscan_eps_min)
 
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(object_pts.astype(np.float64))
@@ -316,66 +354,245 @@ class RockSegmentor:
             pcd.cluster_dbscan(eps=eps, min_points=cfg.dbscan_min_pts, print_progress=False)
         )
 
-        clusters: List[RockCluster] = []
-        unique_labels = np.unique(labels)
+        valid_labels = labels[labels >= 0]
+        if valid_labels.size == 0:
+            selected, status = self._select_tracked_cluster([])
+            return ([selected] if selected is not None else []), labels.astype(np.int32), status
 
+        unique_labels = np.unique(valid_labels)
+        candidates: List[RockCluster] = []
         for cid in unique_labels:
-            if cid < 0:
-                continue
             mask = labels == cid
-            c_pts = object_pts[mask]
+            if int(mask.sum()) < cfg.dbscan_min_pts:
+                continue
+            cluster = self._build_cluster_candidate(
+                int(cid),
+                object_pts[mask],
+                object_heights[mask],
+                ground_normal,
+                prob_roca,
+            )
+            if cluster is not None:
+                candidates.append(cluster)
 
-            c_pcd = o3d.geometry.PointCloud()
-            c_pcd.points = o3d.utility.Vector3dVector(c_pts.astype(np.float64))
+        selected, status = self._select_tracked_cluster(candidates)
+        return ([selected] if selected is not None else []), labels.astype(np.int32), status
 
-            try:
-                obb = c_pcd.get_oriented_bounding_box()
-                corners = np.asarray(obb.get_box_points(), dtype=np.float32)
-                center  = np.asarray(obb.center, dtype=np.float32)
-                extent  = np.asarray(obb.extent, dtype=np.float32)
-                R       = np.asarray(obb.R, dtype=np.float32)
-                top_center = self._top_face_center(center, extent, R)
-                top_center_view = self._flip_y_point(top_center)
-            except Exception:
+    def _build_cluster_candidate(
+        self,
+        cid: int,
+        c_pts: np.ndarray,
+        c_heights: np.ndarray,
+        ground_normal: np.ndarray,
+        prob_roca: float,
+    ) -> Optional[RockCluster]:
+        try:
+            centroid = np.mean(c_pts, axis=0).astype(np.float32)
+            centroid_view = self._flip_y_point(centroid)
+            center, extent, R, corners, base_center, top_center, height = self._ground_aligned_obb(
+                c_pts, c_heights, ground_normal
+            )
+            base_center_view = self._flip_y_point(base_center)
+            top_center_view = self._flip_y_point(top_center)
+        except Exception:
+            return None
+
+        cluster = RockCluster(
+            cluster_id  = cid,
+            prob_roca   = prob_roca,
+            n_points    = int(c_pts.shape[0]),
+            centroid    = centroid,
+            centroid_view = centroid_view,
+            base_center = base_center,
+            base_center_view = base_center_view,
+            height_above_ground = height,
+            obb_center  = center,
+            obb_extent  = extent,
+            obb_corners = corners,
+            obb_R       = R,
+            top_face_center      = top_center,
+            top_face_center_view = top_center_view,
+        )
+        if not self._is_plausible_rock_candidate(cluster):
+            return None
+        cluster.candidate_score = self._rock_candidate_score(cluster)
+        return cluster
+
+    def _is_plausible_rock_candidate(self, cluster: RockCluster) -> bool:
+        cfg = self.cfg
+        footprint_a = max(float(cluster.obb_extent[0]), 1e-6)
+        footprint_b = max(float(cluster.obb_extent[1]), 1e-6)
+        length = max(footprint_a, footprint_b)
+        width = min(footprint_a, footprint_b)
+        aspect = length / max(width, 1e-6)
+        footprint = length * width
+        height = float(cluster.height_above_ground)
+
+        return (
+            height >= cfg.rock_min_height
+            and height <= cfg.rock_max_height
+            and aspect <= cfg.rock_max_aspect
+            and footprint <= cfg.rock_max_footprint
+        )
+
+    def _rock_candidate_score(self, cluster: RockCluster) -> float:
+        cfg = self.cfg
+        footprint_a = max(float(cluster.obb_extent[0]), 1e-6)
+        footprint_b = max(float(cluster.obb_extent[1]), 1e-6)
+        length = max(footprint_a, footprint_b)
+        width = min(footprint_a, footprint_b)
+        height = max(float(cluster.height_above_ground), 1e-6)
+        aspect = length / max(width, 1e-6)
+        footprint = length * width
+
+        score = float(np.log1p(cluster.n_points))
+        if height < cfg.rock_min_height:
+            score -= (cfg.rock_min_height - height) * 20.0
+        if height > cfg.rock_max_height:
+            score -= (height - cfg.rock_max_height) * 8.0
+        if aspect > cfg.rock_max_aspect:
+            score -= (aspect - cfg.rock_max_aspect) * 0.35
+        if footprint > cfg.rock_max_footprint:
+            score -= (footprint - cfg.rock_max_footprint) * 2.0
+        return score
+
+    def _select_tracked_cluster(
+        self,
+        candidates: List[RockCluster],
+    ) -> Tuple[Optional[RockCluster], str]:
+        cfg = self.cfg
+
+        if not candidates:
+            if self._last_cluster is not None and self._should_hold_track():
+                return self._hold_last_cluster(), "hold"
+            self._last_cluster = None
+            self._missed_track_frames = 0
+            return None, "lost"
+
+        if not cfg.tracking_enabled or self._last_cluster is None:
+            selected = max(candidates, key=lambda c: c.candidate_score)
+            self._commit_track(selected, "init")
+            return selected, "init"
+
+        prev = self._last_cluster
+        matches: list[Tuple[float, RockCluster]] = []
+        for candidate in candidates:
+            center_dist = float(np.linalg.norm(candidate.base_center - prev.base_center))
+            extent_ratio = self._max_extent_ratio(candidate.obb_extent, prev.obb_extent)
+            candidate.match_distance = center_dist
+
+            if center_dist > cfg.track_max_center_jump:
+                continue
+            if extent_ratio > cfg.track_max_extent_ratio:
                 continue
 
-            clusters.append(RockCluster(
-                cluster_id  = int(cid),
-                prob_roca   = prob_roca,
-                n_points    = int(mask.sum()),
-                obb_center  = center,
-                obb_extent  = extent,
-                obb_corners = corners,
-                obb_R       = R,
-                top_face_center      = top_center,
-                top_face_center_view = top_center_view,
-            ))
+            tracking_score = (
+                candidate.candidate_score
+                - 6.0 * (center_dist / max(cfg.track_max_center_jump, 1e-6))
+                - 2.0 * np.log(max(extent_ratio, 1.0))
+            )
+            matches.append((float(tracking_score), candidate))
 
-        return clusters, labels
+        if matches:
+            selected = max(matches, key=lambda item: item[0])[1]
+            self._commit_track(selected, "tracked")
+            return selected, "tracked"
+
+        if self._should_hold_track():
+            return self._hold_last_cluster(), "hold"
+
+        selected = max(candidates, key=lambda c: c.candidate_score)
+        self._commit_track(selected, "reacquired")
+        return selected, "reacquired"
+
+    def _commit_track(self, cluster: RockCluster, status: str) -> None:
+        cluster.tracking_status = status
+        self._last_cluster = cluster
+        self._missed_track_frames = 0
+
+    def _should_hold_track(self) -> bool:
+        self._missed_track_frames += 1
+        return (
+            self._last_cluster is not None
+            and self._missed_track_frames <= self.cfg.track_hold_frames
+        )
+
+    def _hold_last_cluster(self) -> RockCluster:
+        assert self._last_cluster is not None
+        self._last_cluster.tracking_status = "hold"
+        return self._last_cluster
 
     @staticmethod
-    def _top_face_center(
-        center: np.ndarray,
-        extent: np.ndarray,
-        R: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Centro de la cara superior del OBB.
+    def _max_extent_ratio(a: np.ndarray, b: np.ndarray) -> float:
+        a = np.maximum(a.astype(np.float32), 0.03)
+        b = np.maximum(b.astype(np.float32), 0.03)
+        ratios = np.maximum(a / b, b / a)
+        return float(np.max(ratios))
 
-        En la camara Basler/OpenCV el eje Y crece hacia abajo, por eso la
-        direccion fisica "arriba" es -Y. Open3D devuelve extent como largo
-        completo por eje, asi que se avanza extent/2 desde el centro.
-        """
-        camera_up = np.array([0.0, -1.0, 0.0], dtype=np.float32)
-        axes = R.astype(np.float32)
-        dots = axes.T @ camera_up
-        axis_idx = int(np.argmax(np.abs(dots)))
+    @staticmethod
+    def _ground_aligned_obb(
+        pts: np.ndarray,
+        heights: np.ndarray,
+        ground_normal: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+        n = ground_normal.astype(np.float32)
+        n /= max(float(np.linalg.norm(n)), 1e-6)
 
-        top_normal = axes[:, axis_idx]
-        if dots[axis_idx] < 0:
-            top_normal = -top_normal
+        base_pts = pts - heights.reshape(-1, 1).astype(np.float32) * n
+        base_mean = np.mean(base_pts, axis=0).astype(np.float32)
 
-        return (center + top_normal * (float(extent[axis_idx]) * 0.5)).astype(np.float32)
+        ref = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        if abs(float(ref @ n)) > 0.9:
+            ref = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+        u = ref - float(ref @ n) * n
+        u /= max(float(np.linalg.norm(u)), 1e-6)
+        v = np.cross(n, u).astype(np.float32)
+        v /= max(float(np.linalg.norm(v)), 1e-6)
+
+        centered = base_pts - base_mean
+        coords = np.column_stack((centered @ u, centered @ v)).astype(np.float32)
+        if coords.shape[0] >= 3:
+            cov = np.cov(coords, rowvar=False)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            principal = eigvecs[:, int(np.argmax(eigvals))].astype(np.float32)
+            u = (u * principal[0] + v * principal[1]).astype(np.float32)
+            u /= max(float(np.linalg.norm(u)), 1e-6)
+            v = np.cross(n, u).astype(np.float32)
+            v /= max(float(np.linalg.norm(v)), 1e-6)
+            coords = np.column_stack((centered @ u, centered @ v)).astype(np.float32)
+
+        xy_min = coords.min(axis=0)
+        xy_max = coords.max(axis=0)
+        xy_mid = (xy_min + xy_max) * 0.5
+        width, depth = (xy_max - xy_min).astype(np.float32)
+
+        height = max(float(np.max(heights)), 0.001)
+        base_center = (base_mean + u * xy_mid[0] + v * xy_mid[1]).astype(np.float32)
+        top_center = (base_center + n * height).astype(np.float32)
+        center = (base_center + n * (height * 0.5)).astype(np.float32)
+        extent = np.array([max(float(width), 0.001), max(float(depth), 0.001), height], dtype=np.float32)
+        R = np.column_stack((u, v, n)).astype(np.float32)
+        if np.linalg.det(R.astype(np.float64)) < 0:
+            R[:, 1] = -R[:, 1]
+
+        corners = RockSegmentor._obb_corners(center, extent, R)
+        return center, extent, R, corners, base_center, top_center, float(height)
+
+    @staticmethod
+    def _obb_corners(center: np.ndarray, extent: np.ndarray, R: np.ndarray) -> np.ndarray:
+        half = extent.astype(np.float32) * 0.5
+        local = np.array([
+            [-half[0], -half[1], -half[2]],
+            [ half[0], -half[1], -half[2]],
+            [ half[0],  half[1], -half[2]],
+            [-half[0],  half[1], -half[2]],
+            [-half[0], -half[1],  half[2]],
+            [ half[0], -half[1],  half[2]],
+            [ half[0],  half[1],  half[2]],
+            [-half[0],  half[1],  half[2]],
+        ], dtype=np.float32)
+        return (center.reshape(1, 3) + local @ R.T).astype(np.float32)
 
     @staticmethod
     def _flip_y_point(point: np.ndarray) -> np.ndarray:
