@@ -69,7 +69,7 @@ SEG_CFG = SegConfig(
     ransac_dist      = 0.03,   # tolerancia al ajustar el plano suelo
     ransac_n         = 3,
     ransac_iter      = 1000,
-    min_height_above = 0.02,   # mínimo 2cm sobre el suelo para ser "objeto"
+    min_height_above = 0.07,   # ignora relieve/grizzly bajo sobre el suelo
     max_object_pts   = 80_000,
     dbscan_knn       = 15,
     dbscan_eps_pct   = 95.0,
@@ -505,8 +505,48 @@ def _offline_loop(npz_paths: list) -> None:
         time.sleep(0.1)   # ~10fps simulado
 
 
-def main(offline: str | None = None) -> None:
+def _latest_api_result() -> SegResult | None:
+    with LATEST["lock"]:
+        return LATEST["seg"]
+
+
+def _latest_api_status() -> dict:
+    with LATEST["lock"]:
+        return {
+            "source": "offline" if LATEST.get("offline") else "camera",
+            "has_frame": LATEST["xyz"] is not None,
+        }
+
+
+def _start_api_thread(host: str, port: int) -> None:
+    from segmentation_api import run_api_server
+
+    thread = threading.Thread(
+        target=run_api_server,
+        kwargs={
+            "get_result": _latest_api_result,
+            "get_status": _latest_api_status,
+            "host": host,
+            "port": port,
+            "title": "3dcamera Viewer API",
+        },
+        daemon=True,
+    )
+    thread.start()
+    log.info("API HTTP activa en http://%s:%d", host, port)
+
+
+def main(
+    offline: str | None = None,
+    api: bool = False,
+    api_host: str = "127.0.0.1",
+    api_port: int = 8000,
+) -> None:
     cam = None
+    LATEST["offline"] = bool(offline)
+
+    if api:
+        _start_api_thread(api_host, api_port)
 
     if offline:
         import glob
@@ -697,5 +737,16 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--offline", default=None,
                    help="Glob de archivos .npz para modo sin cámara. Ej: frames/*.npz")
+    p.add_argument("--api", action="store_true",
+                   help="Expone la segmentacion actual por HTTP/WebSocket.")
+    p.add_argument("--api-host", default="127.0.0.1",
+                   help="Host HTTP. Usa 0.0.0.0 para red local o tunel.")
+    p.add_argument("--api-port", type=int, default=8000,
+                   help="Puerto HTTP para la API.")
     args = p.parse_args()
-    main(offline=args.offline)
+    main(
+        offline=args.offline,
+        api=args.api,
+        api_host=args.api_host,
+        api_port=args.api_port,
+    )

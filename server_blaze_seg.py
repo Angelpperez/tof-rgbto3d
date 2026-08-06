@@ -12,6 +12,7 @@ import struct
 import threading
 import time
 import logging
+import os
 
 import numpy as np
 import cv2
@@ -48,7 +49,7 @@ SEG_CFG = SegConfig(
     ransac_dist      = 0.03,
     ransac_n         = 3,
     ransac_iter      = 1000,
-    min_height_above = 0.02,
+    min_height_above = 0.07,
     max_object_pts   = 80_000,
     dbscan_knn       = 15,
     dbscan_eps_pct   = 95.0,
@@ -71,6 +72,46 @@ LATEST = {
     "seg":       None,     # SegResult o None
     "lock":      threading.Lock(),
 }
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on", "si", "s"}
+
+
+def _latest_api_result() -> SegResult | None:
+    with LATEST["lock"]:
+        return LATEST["seg"]
+
+
+def _latest_api_status() -> dict:
+    with LATEST["lock"]:
+        return {
+            "source": "camera-server",
+            "has_frame": LATEST["xyz"] is not None,
+        }
+
+
+def _start_api_thread() -> None:
+    from segmentation_api import run_api_server
+
+    host = os.getenv("SEG_API_HOST", "127.0.0.1")
+    port = int(os.getenv("SEG_API_PORT", "8000"))
+    thread = threading.Thread(
+        target=run_api_server,
+        kwargs={
+            "get_result": _latest_api_result,
+            "get_status": _latest_api_status,
+            "host": host,
+            "port": port,
+            "title": "3dcamera Server API",
+        },
+        daemon=True,
+    )
+    thread.start()
+    log.info("[API] HTTP activa en http://%s:%d", host, port)
 
 # ---------------------------------------------------------------------------
 # Helpers de captura (idénticos a server_blaze.py)
@@ -417,6 +458,8 @@ def rpc_server_loop() -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    if _env_bool("SEG_API_ENABLED", False):
+        _start_api_thread()
     threading.Thread(target=segmentation_loop, daemon=True).start()
     threading.Thread(target=udp_stream_loop,   daemon=True).start()
     threading.Thread(target=rpc_server_loop,   daemon=True).start()

@@ -8,3 +8,5 @@ scipy
 pandas
 xgboost
 joblib
+fastapi
+uvicorn[standard]

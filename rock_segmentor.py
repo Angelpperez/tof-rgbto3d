@@ -77,7 +77,7 @@ class SegConfig:
     ransac_dist:        float = 0.03    # metros — tolerancia al ajustar el plano
     ransac_n:           int   = 3
     ransac_iter:        int   = 1000
-    min_height_above:   float = 0.02    # metros — mínimo para ser "objeto" sobre el suelo
+    min_height_above:   float = 0.07    # metros — ignora relieve/grizzly bajo sobre el suelo
 
     # Submuestreo de objetos antes de DBSCAN
     max_object_pts: int  = 80_000
