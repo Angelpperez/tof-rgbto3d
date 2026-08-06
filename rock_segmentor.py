@@ -107,6 +107,7 @@ class SegConfig:
     # Tracking temporal: evita saltar al picaroca/pierna cuando entra en escena
     tracking_enabled: bool = True
     track_max_center_jump: float = 0.35
+    track_reacquire_radius: float = 2.0
     track_max_extent_ratio: float = 2.5
     track_dimension_tolerance: float = 0.10
     track_hold_frames: int = 90
@@ -531,6 +532,11 @@ class RockSegmentor:
             self._commit_track(selected, "tracked")
             return selected, "tracked"
 
+        far_candidate = self._select_far_reacquire_candidate(eligible, prev)
+        if far_candidate is not None:
+            self._commit_track(far_candidate, "reacquired_far")
+            return far_candidate, "reacquired_far"
+
         if self._should_hold_track():
             return self._hold_last_cluster(), "hold"
 
@@ -582,6 +588,46 @@ class RockSegmentor:
                     tol,
                 )
         return compatible
+
+    def _select_far_reacquire_candidate(
+        self,
+        candidates: List[RockCluster],
+        prev: RockCluster,
+    ) -> Optional[RockCluster]:
+        cfg = self.cfg
+        radius = max(cfg.track_reacquire_radius, cfg.track_max_center_jump)
+        scored: list[Tuple[float, RockCluster]] = []
+
+        for candidate in candidates:
+            center_dist = float(np.linalg.norm(candidate.base_center - prev.base_center))
+            candidate.match_distance = center_dist
+            if center_dist > radius:
+                continue
+
+            extent_ratio = self._max_extent_ratio(candidate.dimensions_lwh, prev.dimensions_lwh)
+            if extent_ratio > cfg.track_max_extent_ratio:
+                continue
+
+            dimension_delta = self._dimension_delta_lwh(candidate)
+            distance_penalty = 3.0 * (center_dist / max(radius, 1e-6))
+            dimension_penalty = 4.0 * float(
+                np.sum(dimension_delta) / max(cfg.track_dimension_tolerance, 1e-6)
+            )
+            score = candidate.candidate_score - distance_penalty - dimension_penalty
+            scored.append((float(score), candidate))
+
+        if not scored:
+            return None
+
+        selected = max(scored, key=lambda item: item[0])[1]
+        log.info(
+            "[TRACK] reacquired_far cid=%d dist=%.3fm LWH=%s ref=%s",
+            selected.cluster_id,
+            selected.match_distance,
+            np.round(selected.dimensions_lwh, 3).tolist(),
+            np.round(self._dimension_reference_lwh(), 3).tolist(),
+        )
+        return selected
 
     def _should_hold_track(self) -> bool:
         self._missed_track_frames += 1
