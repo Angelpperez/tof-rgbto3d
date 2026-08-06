@@ -92,6 +92,8 @@ LATEST: dict = {
     "seg":  None,       # SegResult
     "frame_id": 0,      # incrementa una vez por frame capturado
     "seg_frame_id": 0,  # frame_id usado por la ultima segmentacion
+    "reset_seq": 0,     # incrementa cuando se solicita reset de tracking
+    "reset_applied_seq": 0,
     "lock": threading.Lock(),
     "stop": False,
 }
@@ -471,6 +473,7 @@ def capture_loop(cam) -> None:
 
 def seg_loop(segmentor: RockSegmentor) -> None:
     last_processed_frame_id = -SEG_EVERY
+    last_reset_seq = 0
     simulink_sender = SimulinkUdpSender.from_env()
 
     while not LATEST["stop"]:
@@ -479,9 +482,21 @@ def seg_loop(segmentor: RockSegmentor) -> None:
             conf  = LATEST["conf"]
             intens = LATEST["intens"]
             frame_id = LATEST["frame_id"]
+            reset_seq = LATEST["reset_seq"]
 
         if xyz is None:
             time.sleep(0.01)
+            continue
+
+        if reset_seq != last_reset_seq:
+            segmentor.reset_tracking()
+            last_processed_frame_id = frame_id - SEG_EVERY
+            last_reset_seq = reset_seq
+            with LATEST["lock"]:
+                LATEST["seg"] = None
+                LATEST["seg_frame_id"] = 0
+                LATEST["reset_applied_seq"] = reset_seq
+            log.info("[RESET] tracking reiniciado")
             continue
 
         # Procesa frames reales, sin cola: si se atrasa, toma el ultimo disponible.
@@ -543,6 +558,8 @@ def _latest_api_status() -> dict:
             "has_frame": LATEST["xyz"] is not None,
             "frame_id": LATEST["frame_id"],
             "seg_frame_id": LATEST["seg_frame_id"],
+            "reset_seq": LATEST["reset_seq"],
+            "reset_applied_seq": LATEST["reset_applied_seq"],
         }
 
 
@@ -562,6 +579,14 @@ def _start_api_thread(host: str, port: int) -> None:
     )
     thread.start()
     log.info("API HTTP activa en http://%s:%d", host, port)
+
+
+def _request_tracking_reset(vis) -> bool:
+    with LATEST["lock"]:
+        LATEST["reset_seq"] += 1
+        reset_seq = LATEST["reset_seq"]
+    log.info("[RESET] solicitado desde visor (seq=%d)", reset_seq)
+    return False
 
 
 def main(
@@ -612,8 +637,9 @@ def main(
         time.sleep(0.05)
 
     # --- Open3D Visualizer ---
-    vis = o3d.visualization.Visualizer()
+    vis = o3d.visualization.VisualizerWithKeyCallback()
     vis.create_window("Rock Segmentor — Basler ToF 101", width=1280, height=720)
+    vis.register_key_callback(ord("R"), _request_tracking_reset)
 
     opt = vis.get_render_option()
     opt.point_size        = 2.0
@@ -635,6 +661,18 @@ def main(
     first_reset  = True
     last_seg_ts  = 0.0
     last_render_frame_id = -1
+    last_visual_reset_seq = 0
+
+    def clear_tracking_overlay() -> None:
+        semantic_pcd.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+        semantic_pcd.colors = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+        vis.update_geometry(semantic_pcd)
+        for obb in active_obbs:
+            vis.remove_geometry(obb, reset_bounding_box=False)
+        active_obbs.clear()
+        for marker in active_annotations:
+            vis.remove_geometry(marker, reset_bounding_box=False)
+        active_annotations.clear()
 
     try:
         while True:
@@ -642,6 +680,7 @@ def main(
                 xyz = LATEST["xyz"]
                 seg = LATEST["seg"]
                 frame_id = LATEST["frame_id"]
+                reset_seq = LATEST["reset_seq"]
 
             if xyz is None:
                 time.sleep(0.01)
@@ -649,6 +688,11 @@ def main(
                     break
                 vis.update_renderer()
                 continue
+
+            if reset_seq != last_visual_reset_seq:
+                clear_tracking_overlay()
+                last_visual_reset_seq = reset_seq
+                last_seg_ts = seg.timestamp if seg is not None else 0.0
 
             seg_changed = seg is not None and seg.timestamp > last_seg_ts
             raw_changed = frame_id != last_render_frame_id

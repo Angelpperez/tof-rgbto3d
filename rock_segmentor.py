@@ -155,6 +155,11 @@ class RockSegmentor:
                 cfg.model_path
             )
 
+    def reset_tracking(self) -> None:
+        self._last_cluster = None
+        self._target_dimensions_lwh = None
+        self._missed_track_frames = 0
+
     def process(
         self,
         xyz_hw3:    np.ndarray,
