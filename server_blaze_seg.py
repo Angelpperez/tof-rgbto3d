@@ -13,6 +13,7 @@ import threading
 import time
 import logging
 import os
+import zlib
 
 import numpy as np
 import cv2
@@ -34,6 +35,7 @@ log = logging.getLogger("server_seg")
 
 UDP_STREAM_IP   = "127.0.0.1"
 UDP_STREAM_PORT = 5005
+UDP_STREAM_V2_PORT = 5007
 
 TCP_RPC_IP   = "127.0.0.1"
 TCP_RPC_PORT = 6006
@@ -42,6 +44,11 @@ STRIDE      = 4      # downsample para UDP (sube si va lento)
 CONF_MIN    = 0      # filtro de confianza para UDP
 SEG_EVERY   = 5      # correr segmentacion cada N frames capturados reales
 SEG_STRIDE  = 3      # submuestreo espacial para segmentacion
+
+V2_MAGIC = b"BLZ2"
+V2_VERSION = 2
+V2_MTU = 60_000
+V2_HEADER = struct.Struct("<4sHHQQHHIII")
 
 SEG_CFG = SegConfig(
     conf_min         = 200,
@@ -354,6 +361,63 @@ def udp_stream_loop() -> None:
 
         time.sleep(0.03)
 
+
+def _pack_v2_frame_payload(pts: np.ndarray, cols: np.ndarray, seg: SegResult) -> bytes:
+    header = struct.pack("<I", int(pts.shape[0]))
+    xyz_bytes = pts.astype(np.float32).tobytes(order="C")
+    rgb_bytes = cols[:, ::-1].astype(np.uint8).tobytes(order="C")
+    return header + xyz_bytes + rgb_bytes + _pack_obb_payload(seg)
+
+
+def _send_v2_frame(sock: socket.socket, frame_id: int, timestamp_ns: int, payload: bytes) -> None:
+    max_chunk_payload = V2_MTU - V2_HEADER.size
+    chunk_count = max(1, (len(payload) + max_chunk_payload - 1) // max_chunk_payload)
+
+    for chunk_index in range(chunk_count):
+        start = chunk_index * max_chunk_payload
+        chunk = payload[start:start + max_chunk_payload]
+        header = V2_HEADER.pack(
+            V2_MAGIC,
+            V2_VERSION,
+            V2_HEADER.size,
+            int(frame_id),
+            int(timestamp_ns),
+            int(chunk_index),
+            int(chunk_count),
+            int(len(chunk)),
+            int(len(payload)),
+            zlib.crc32(chunk) & 0xFFFFFFFF,
+        )
+        sock.sendto(header + chunk, (UDP_STREAM_IP, UDP_STREAM_V2_PORT))
+
+
+def udp_stream_v2_loop() -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    last_sent_frame_id = 0
+    log.info("[UDPv2] enviando a %s:%d", UDP_STREAM_IP, UDP_STREAM_V2_PORT)
+
+    while True:
+        with LATEST["lock"]:
+            xyz       = LATEST["xyz"]
+            depth_bgr = LATEST["depth_bgr"]
+            conf      = LATEST["conf"]
+            seg       = LATEST["seg"]
+            frame_id  = LATEST["frame_id"]
+
+        if xyz is None or depth_bgr is None or frame_id == last_sent_frame_id:
+            time.sleep(0.002)
+            continue
+
+        pts, cols = build_points(xyz, depth_bgr, conf, stride=STRIDE, conf_min=CONF_MIN)
+        if pts.shape[0] == 0:
+            time.sleep(0.002)
+            continue
+
+        pts_m = pts.astype(np.float32, copy=False) * float(SEG_CFG.xyz_scale)
+        payload = _pack_v2_frame_payload(pts_m, cols, seg)
+        _send_v2_frame(sock, frame_id, time.time_ns(), payload)
+        last_sent_frame_id = frame_id
+
 # ---------------------------------------------------------------------------
 # rpc_server_loop — click (x,y,z) → cluster más cercano
 # ---------------------------------------------------------------------------
@@ -409,6 +473,7 @@ def rpc_handle_client(conn) -> None:
             return
 
         pts, _ = build_points(xyz, depth_bgr, conf_arr, stride=STRIDE, conf_min=CONF_MIN)
+        pts = pts.astype(np.float32, copy=False) * float(SEG_CFG.xyz_scale)
         if pts.shape[0] == 0:
             _rpc_err(conn, "empty cloud")
             return
@@ -483,5 +548,6 @@ if __name__ == "__main__":
         _start_api_thread()
     threading.Thread(target=segmentation_loop, daemon=True).start()
     threading.Thread(target=udp_stream_loop,   daemon=True).start()
+    threading.Thread(target=udp_stream_v2_loop, daemon=True).start()
     threading.Thread(target=rpc_server_loop,   daemon=True).start()
     capture_loop()

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Blaze Realtime PointCloud Viewer",
     "author": "Angel + ChatGPT",
-    "version": (0, 4, 3),
+    "version": (0, 4, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Blaze",
     "category": "3D View",
@@ -13,20 +13,12 @@ import socket
 import struct
 import time
 import zlib
-import blf
 from mathutils import Vector
 
 try:
     import numpy as np
 except Exception:
     np = None
-
-try:
-    import gpu
-    from gpu_extras.batch import batch_for_shader
-except Exception:
-    gpu = None
-    batch_for_shader = None
 
 UDP_IP = "127.0.0.1"
 UDP_PORT = 5005
@@ -49,19 +41,7 @@ STATE = {
     "last_frame_id": 0,
     "last_latency_ms": 0.0,
     "dropped_frames": 0,
-    "last_error": "",
     "obbs": [],
-    "draw_handler": None,
-    "label_handler": None,
-    "gpu_batch": None,
-    "gpu_shader": None,
-    "gpu_color_shader": None,
-    "gpu_uniform_shader": None,
-    "gpu_uses_vertex_color": False,
-    "gpu_point_count": 0,
-    "label_items": [],
-    "fit_center": None,
-    "fit_scale": 1.0,
     "lock": threading.Lock(),
     "obj_name": "BlazePointCloud",
     "bbox_name": "BlazeBBox",
@@ -135,40 +115,6 @@ def apply_axis_ops_array(pts):
     return out
 
 
-def inverse_axis_ops(p):
-    x, y, z = p
-    if STATE["flip_x"]:
-        x = -x
-    if STATE["flip_y"]:
-        y = -y
-    if STATE["flip_z"]:
-        z = -z
-    if STATE["swap_yz"]:
-        y, z = z, y
-    return (x, y, z)
-
-
-def source_to_display_point(point):
-    p = apply_axis_ops(point)
-    center = STATE.get("fit_center")
-    scale = float(STATE.get("fit_scale") or 1.0)
-    if STATE["auto_fit"] and center is not None:
-        return tuple(apply_fit_transform([p], center, scale)[0])
-    return p
-
-
-def display_to_source_point(point):
-    x, y, z = point
-    center = STATE.get("fit_center")
-    scale = float(STATE.get("fit_scale") or 1.0)
-    if STATE["auto_fit"] and center is not None and abs(scale) > 1e-9:
-        cx, cy, cz = np.asarray(center, dtype=np.float32).reshape(3) if np is not None else center
-        x = (float(x) / scale) + float(cx)
-        y = (float(y) / scale) + float(cy)
-        z = (float(z) / scale) + float(cz)
-    return inverse_axis_ops((x, y, z))
-
-
 def center_and_scale(pts):
     # pts: list[(x,y,z)]
     # centrar
@@ -196,362 +142,45 @@ def center_and_scale(pts):
     return out
 
 
-def compute_fit_transform(pts):
-    if np is not None:
-        arr = np.asarray(pts, dtype=np.float32).reshape(-1, 3)
-        if arr.shape[0] == 0:
-            return np.zeros(3, dtype=np.float32), 1.0
-        mn = arr.min(axis=0)
-        mx = arr.max(axis=0)
-        center = ((mn + mx) * 0.5).astype(np.float32)
-        max_extent = float(np.max(mx - mn))
-        scale = 1.0 if max_extent < 1e-9 else STATE["target_size"] / max_extent
-        return center, float(scale)
-
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    zs = [p[2] for p in pts]
-    center = (
-        (min(xs) + max(xs)) * 0.5,
-        (min(ys) + max(ys)) * 0.5,
-        (min(zs) + max(zs)) * 0.5,
-    )
-    max_extent = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
-    scale = 1.0 if max_extent < 1e-9 else STATE["target_size"] / max_extent
-    return center, float(scale)
-
-
-def apply_fit_transform(pts, center, scale):
-    if np is not None:
-        arr = np.asarray(pts, dtype=np.float32).reshape(-1, 3)
-        cen = np.asarray(center, dtype=np.float32).reshape(1, 3)
-        return ((arr - cen) * float(scale)).astype(np.float32, copy=False)
-
-    cx, cy, cz = center
-    return [
-        ((p[0] - cx) * scale, (p[1] - cy) * scale, (p[2] - cz) * scale)
-        for p in pts
-    ]
-
-
 def center_and_scale_frame(pts, obbs):
-    center, scale = compute_fit_transform(pts)
-    fit_pts = apply_fit_transform(pts, center, scale)
-    fit_obbs = [apply_fit_transform(corners, center, scale) for corners in obbs]
-    return fit_pts, fit_obbs, center, scale
-
-
-def get_gpu_shader(use_vertex_color=False):
-    if gpu is None or batch_for_shader is None:
-        return None
-
-    cache_key = "gpu_color_shader" if use_vertex_color else "gpu_uniform_shader"
-    shader = STATE.get(cache_key)
-    if shader is not None:
-        return shader
-
-    names = (
-        ("SMOOTH_COLOR", "3D_SMOOTH_COLOR")
-        if use_vertex_color
-        else ("POINT_UNIFORM_COLOR", "UNIFORM_COLOR", "3D_UNIFORM_COLOR")
-    )
-    for builtin_name in names:
-        try:
-            shader = gpu.shader.from_builtin(builtin_name)
-            STATE[cache_key] = shader
-            return shader
-        except Exception:
-            continue
-
-    return None
-
-
-def obb_dimensions_from_corners(corners):
-    arr = np.asarray(corners, dtype=np.float32).reshape(8, 3) if np is not None else None
-    if arr is None:
-        arr = [[float(v[0]), float(v[1]), float(v[2])] for v in corners]
-        d01 = sum((arr[1][i] - arr[0][i]) ** 2 for i in range(3)) ** 0.5
-        d03 = sum((arr[3][i] - arr[0][i]) ** 2 for i in range(3)) ** 0.5
-        d04 = sum((arr[4][i] - arr[0][i]) ** 2 for i in range(3)) ** 0.5
-    else:
-        d01 = float(np.linalg.norm(arr[1] - arr[0]))
-        d03 = float(np.linalg.norm(arr[3] - arr[0]))
-        d04 = float(np.linalg.norm(arr[4] - arr[0]))
-
-    length = max(d01, d03)
-    width = min(d01, d03)
-    return (length, width, d04)
-
-
-def points_inside_obb(pts, corners):
     if np is None:
-        return None
+        fit_pts = center_and_scale(pts)
+        fit_obbs = [center_and_scale(corners) for corners in obbs]
+        return fit_pts, fit_obbs
 
-    p = np.asarray(pts, dtype=np.float32).reshape(-1, 3)
-    c = np.asarray(corners, dtype=np.float32).reshape(8, 3)
-    axes = np.stack((c[1] - c[0], c[3] - c[0], c[4] - c[0]), axis=0)
-    extents = np.linalg.norm(axes, axis=1)
-    if np.any(extents < 1e-6):
-        return None
+    if pts.shape[0] == 0:
+        return pts, obbs
 
-    axes = axes / extents.reshape(3, 1)
-    center = c.mean(axis=0)
-    local = (p - center.reshape(1, 3)) @ axes.T
-    margin = max(0.03, float(STATE["point_radius"]) * 4.0)
-    return np.all(np.abs(local) <= ((extents * 0.5 + margin).reshape(1, 3)), axis=1)
+    mn = pts.min(axis=0)
+    mx = pts.max(axis=0)
+    center = (mn + mx) * 0.5
+    max_extent = float(np.max(mx - mn))
+    scale = 1.0 if max_extent < 1e-9 else STATE["target_size"] / max_extent
 
-
-def build_semantic_colors(pts, rgb_colors, obbs):
-    if np is None:
-        return None
-
-    n = len(pts)
-    if n == 0:
-        return None
-
-    rgba = np.empty((n, 4), dtype=np.float32)
-    rgba[:, 0] = 0.36
-    rgba[:, 1] = 0.36
-    rgba[:, 2] = 0.36
-    rgba[:, 3] = 0.92
-
-    if not obbs and rgb_colors is not None:
-        rgb = np.asarray(rgb_colors, dtype=np.float32).reshape(-1, 3)[:n] / 255.0
-        rgba[:, :3] = rgb
-        rgba[:, 3] = 1.0
-        return rgba
-
-    palette = (
-        (0.08, 0.63, 1.00, 1.0),
-        (1.00, 0.76, 0.12, 1.0),
-        (0.20, 0.95, 0.55, 1.0),
-    )
-    for idx, obb in enumerate(obbs[:3]):
-        mask = points_inside_obb(pts, obb["corners"])
-        if mask is None:
-            continue
-        rgba[mask] = palette[idx % len(palette)]
-
-    return rgba
-
-
-def set_gpu_point_data(pts, colors=None, obbs=None):
-    rgba = build_semantic_colors(pts, colors, obbs or [])
-    shader = get_gpu_shader(use_vertex_color=rgba is not None)
-    if shader is None:
-        return False
-
-    if np is not None:
-        coords = np.ascontiguousarray(np.asarray(pts, dtype=np.float32).reshape(-1, 3))
-    else:
-        coords = [(float(p[0]), float(p[1]), float(p[2])) for p in pts]
-
-    if rgba is not None:
-        STATE["gpu_batch"] = batch_for_shader(shader, 'POINTS', {"pos": coords, "color": rgba})
-        STATE["gpu_uses_vertex_color"] = True
-    else:
-        STATE["gpu_batch"] = batch_for_shader(shader, 'POINTS', {"pos": coords})
-        STATE["gpu_uses_vertex_color"] = False
-    STATE["gpu_shader"] = shader
-    STATE["gpu_point_count"] = len(pts)
-    return True
-
-
-def draw_gpu_points():
-    if gpu is None:
-        return
-    if not STATE["running"] or STATE["stream_mode"] != "v2":
-        return
-
-    batch = STATE.get("gpu_batch")
-    shader = STATE.get("gpu_shader")
-    if batch is None or shader is None:
-        return
-
-    try:
-        point_px = max(1.0, min(12.0, float(STATE["point_radius"]) * 300.0))
-        try:
-            gpu.state.depth_test_set('LESS_EQUAL')
-            gpu.state.blend_set('ALPHA')
-            gpu.state.point_size_set(point_px)
-        except Exception:
-            pass
-
-        shader.bind()
-        if not STATE.get("gpu_uses_vertex_color"):
-            shader.uniform_float("color", (0.32, 0.72, 1.0, 1.0))
-        batch.draw(shader)
-    except Exception as exc:
-        with STATE["lock"]:
-            STATE["last_error"] = f"GPU draw: {type(exc).__name__}: {exc}"[:160]
-    finally:
-        try:
-            gpu.state.blend_set('NONE')
-        except Exception:
-            pass
-
-
-def build_obb_label_items(obbs):
-    items = []
-    for idx, obb in enumerate(obbs[:3]):
-        corners = obb.get("corners")
-        if corners is None or len(corners) != 8:
-            continue
-
-        dims = obb.get("dimensions_lwh")
-        if dims is None:
-            dims = obb_dimensions_from_corners(corners)
-        length, width, height = [float(v) for v in dims]
-
-        if np is not None:
-            c = np.asarray(corners, dtype=np.float32).reshape(8, 3)
-            pos = c[4:8].mean(axis=0)
-            z_span = float(np.max(c[:, 2]) - np.min(c[:, 2]))
-            pos = pos + np.array([0.0, 0.0, max(0.08, z_span * 0.18)], dtype=np.float32)
-            pos_tuple = (float(pos[0]), float(pos[1]), float(pos[2]))
-        else:
-            top = corners[4:8]
-            pos_tuple = (
-                sum(p[0] for p in top) / 4.0,
-                sum(p[1] for p in top) / 4.0,
-                sum(p[2] for p in top) / 4.0 + 0.08,
-            )
-
-        label = (
-            f"Roca p={float(obb.get('prob', 0.0)):.2f}\n"
-            f"L={length:.2f} W={width:.2f} H={height:.2f} m"
-        )
-        items.append({"pos": pos_tuple, "text": label, "index": idx})
-    return items
-
-
-def draw_label_overlay():
-    if not STATE["running"] or STATE["stream_mode"] != "v2":
-        return
-
-    labels = STATE.get("label_items") or []
-    if not labels:
-        return
-
-    try:
-        from bpy_extras import view3d_utils
-        region = bpy.context.region
-        rv3d = bpy.context.region_data
-        if region is None or rv3d is None:
-            return
-
-        font_id = 0
-        try:
-            blf.size(font_id, 14)
-            blf.color(font_id, 1.0, 0.86, 0.05, 1.0)
-        except TypeError:
-            blf.size(font_id, 14, 72)
-
-        for item in labels:
-            coord = view3d_utils.location_3d_to_region_2d(
-                region,
-                rv3d,
-                Vector(item["pos"]),
-            )
-            if coord is None:
-                continue
-
-            x = float(coord.x) + 8.0
-            y = float(coord.y) + 8.0
-            for line_index, line in enumerate(item["text"].splitlines()):
-                blf.position(font_id, x, y - line_index * 16.0, 0.0)
-                blf.draw(font_id, line)
-    except Exception as exc:
-        with STATE["lock"]:
-            STATE["last_error"] = f"Label draw: {type(exc).__name__}: {exc}"[:160]
-
-
-def ensure_draw_handler():
-    if gpu is None or STATE.get("draw_handler") is not None:
-        pass
-    else:
-        STATE["draw_handler"] = bpy.types.SpaceView3D.draw_handler_add(
-            draw_gpu_points,
-            (),
-            'WINDOW',
-            'POST_VIEW',
-        )
-
-    if STATE.get("label_handler") is None:
-        STATE["label_handler"] = bpy.types.SpaceView3D.draw_handler_add(
-            draw_label_overlay,
-            (),
-            'WINDOW',
-            'POST_PIXEL',
-        )
-
-
-def remove_draw_handler():
-    handler = STATE.get("draw_handler")
-    if handler is not None:
-        try:
-            bpy.types.SpaceView3D.draw_handler_remove(handler, 'WINDOW')
-        except Exception:
-            pass
-    STATE["draw_handler"] = None
-    label_handler = STATE.get("label_handler")
-    if label_handler is not None:
-        try:
-            bpy.types.SpaceView3D.draw_handler_remove(label_handler, 'WINDOW')
-        except Exception:
-            pass
-    STATE["label_handler"] = None
-    STATE["gpu_batch"] = None
-    STATE["gpu_point_count"] = 0
-    STATE["label_items"] = []
-
-
-def get_pointcloud_attribute(pc, name):
-    attrs = getattr(pc, "attributes", None)
-    if attrs is None:
-        return None
-    get_attr = getattr(attrs, "get", None)
-    if get_attr is not None:
-        return get_attr(name)
-    try:
-        return attrs[name]
-    except Exception:
-        return None
+    fit_pts = (pts - center.reshape(1, 3)) * scale
+    fit_obbs = []
+    for corners in obbs:
+        fit_obbs.append((corners - center.reshape(1, 3)) * scale)
+    return fit_pts.astype(np.float32, copy=False), fit_obbs
 
 
 def set_pointcloud_data(obj, pts, radius=0.01):
     pc = obj.data
     n = len(pts)
+    pc.points.clear()
+    pc.points.add(n)
 
-    if hasattr(pc, "resize"):
-        pc.resize(n)
-    else:
-        current = len(pc.points)
-        if current == n:
-            pass
-        elif current < n and hasattr(pc.points, "add"):
-            pc.points.add(n - current)
-        else:
-            raise RuntimeError("PointCloud resize unavailable")
-
-    arr = np.asarray(pts, dtype=np.float32).reshape(-1, 3) if np is not None else None
-
-    if arr is not None:
-        position_attr = get_pointcloud_attribute(pc, "position")
-        if position_attr is not None:
-            position_attr.data.foreach_set("vector", arr.reshape(-1))
-        else:
+    try:
+        if np is not None:
+            arr = np.asarray(pts, dtype=np.float32).reshape(-1, 3)
             pc.points.foreach_set("co", arr.reshape(-1))
-
-        radius_attr = get_pointcloud_attribute(pc, "radius")
-        if radius_attr is not None:
-            radius_attr.data.foreach_set("value", np.full(n, radius, dtype=np.float32))
-        else:
             pc.points.foreach_set("radius", np.full(n, radius, dtype=np.float32))
-    else:
+        else:
+            raise RuntimeError("numpy unavailable")
+    except Exception:
         for i, p in enumerate(pts):
-            pc.points[i].co = (float(p[0]), float(p[1]), float(p[2]))
-            pc.points[i].radius = float(radius)
+            pc.points[i].co = p
+            pc.points[i].radius = radius
 
     pc.update()
 
@@ -591,20 +220,11 @@ def set_obb_from_corners(obj, corners):
         (4,5),(5,6),(6,7),(7,4),
         (0,4),(1,5),(2,6),(3,7)
     ]
-    raw_verts = corners.tolist() if np is not None and hasattr(corners, "tolist") else list(corners)
-    verts = [(float(v[0]), float(v[1]), float(v[2])) for v in raw_verts]
+    verts = corners.tolist() if np is not None and hasattr(corners, "tolist") else list(corners)
     mesh = obj.data
     mesh.clear_geometry()
     mesh.from_pydata(verts, edges, [])
     mesh.update()
-
-
-def clear_bbox_object(obj):
-    try:
-        obj.data.clear_geometry()
-        obj.data.update()
-    except Exception:
-        pass
 
 
 def parse_obb_payload(data, offset):
@@ -680,15 +300,9 @@ def decode_v2_frame(payload, frame_id, timestamp_ns):
     pts = apply_axis_ops_array(pts)
     for obb in obbs:
         obb["corners"] = apply_axis_ops_array(obb["corners"])
-        obb["dimensions_lwh"] = obb_dimensions_from_corners(obb["corners"])
 
-    fit_center = None
-    fit_scale = 1.0
     if STATE["auto_fit"] and len(pts) > 50:
-        pts, fit_corners, fit_center, fit_scale = center_and_scale_frame(
-            pts,
-            [obb["corners"] for obb in obbs],
-        )
+        pts, fit_corners = center_and_scale_frame(pts, [obb["corners"] for obb in obbs])
         for obb, corners in zip(obbs, fit_corners):
             obb["corners"] = corners
 
@@ -699,8 +313,6 @@ def decode_v2_frame(payload, frame_id, timestamp_ns):
         "points": pts,
         "colors": colors,
         "obbs": obbs,
-        "fit_center": fit_center,
-        "fit_scale": fit_scale,
         "latency_ms": latency_ms,
     }
 
@@ -850,55 +462,38 @@ def recv_stream_v2_thread():
     sock.close()
 
 
-def recv_exact(sock, n):
-    chunks = bytearray()
-    while len(chunks) < n:
-        chunk = sock.recv(n - len(chunks))
-        if not chunk:
-            raise RuntimeError("socket closed")
-        chunks.extend(chunk)
-    return bytes(chunks)
-
-
-def normalize_label(label):
-    if label.startswith("roca"):
-        return "Roca" + label[4:]
-    if label == "object":
-        return "Objeto"
-    return label
-
-
 def rpc_click(point):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(2.0)
     s.connect((TCP_IP, TCP_PORT))
     s.sendall(struct.pack("<fff", point[0], point[1], point[2]))
 
-    ok = recv_exact(s, 1)
+    ok = s.recv(1)
     if not ok:
         s.close()
         return None, None
     ok = struct.unpack("<B", ok)[0]
 
     if ok == 1:
-        corners_b = recv_exact(s, 96)
-        prob_roca = struct.unpack("<f", recv_exact(s, 4))[0]
+        corners_b = b""
+        while len(corners_b) < 96:
+            corners_b += s.recv(96 - len(corners_b))
 
         corners = []
         for i in range(8):
             x, y, z = struct.unpack_from("<fff", corners_b, i*12)
-            corners.append(source_to_display_point((x, y, z)))
+            corners.append(apply_axis_ops((x, y, z)))
 
-        ln = struct.unpack("<H", recv_exact(s, 2))[0]
-        label = recv_exact(s, ln).decode("utf-8") if ln else "object"
-        label = normalize_label(label)
-        if "p=" not in label:
-            label = f"{label} (p={prob_roca:.2f})"
+        if STATE["auto_fit"] and len(corners) == 8:
+            corners = center_and_scale(corners)
+
+        ln = struct.unpack("<H", s.recv(2))[0]
+        label = s.recv(ln).decode("utf-8") if ln else "object"
         s.close()
         return corners, label
     else:
-        ln = struct.unpack("<H", recv_exact(s, 2))[0]
-        msg = recv_exact(s, ln).decode("utf-8") if ln else "rpc error"
+        ln = struct.unpack("<H", s.recv(2))[0]
+        msg = s.recv(ln).decode("utf-8") if ln else "rpc error"
         s.close()
         return None, msg
 
@@ -907,70 +502,37 @@ def timer_update():
     if not STATE["running"]:
         return None
 
-    try:
-        if STATE["stream_mode"] == "v2":
-            bbox_obj = ensure_bbox_object()
-            with STATE["lock"]:
-                frame = STATE["latest_frame"]
-                displayed_frame_id = STATE["displayed_frame_id"]
+    obj = ensure_pointcloud_object()
+    if STATE["stream_mode"] == "v2":
+        bbox_obj = ensure_bbox_object()
+        with STATE["lock"]:
+            frame = STATE["latest_frame"]
+            displayed_frame_id = STATE["displayed_frame_id"]
 
-            if frame is None or frame["frame_id"] == displayed_frame_id:
-                return 0.016
-
-            pts = frame["points"]
-            obbs = frame["obbs"]
-            gpu_ok = False
-            gpu_error = ""
-            try:
-                gpu_ok = set_gpu_point_data(pts, colors=frame["colors"], obbs=obbs)
-                if not gpu_ok:
-                    gpu_error = "GPU draw unavailable"
-            except Exception as exc:
-                gpu_error = f"GPU batch: {type(exc).__name__}: {exc}"
-
-            pointcloud_error = ""
-            try:
-                obj = ensure_pointcloud_object()
-                set_pointcloud_data(obj, pts, radius=STATE["point_radius"])
-            except Exception as exc:
-                pointcloud_error = f"PointCloud: {type(exc).__name__}: {exc}"
-
-            if obbs:
-                set_obb_from_corners(bbox_obj, obbs[0]["corners"])
-            else:
-                clear_bbox_object(bbox_obj)
-
-            labels = build_obb_label_items(obbs)
-            with STATE["lock"]:
-                STATE["points"] = pts
-                STATE["colors"] = frame["colors"]
-                STATE["obbs"] = obbs
-                STATE["label_items"] = labels
-                STATE["fit_center"] = frame.get("fit_center")
-                STATE["fit_scale"] = frame.get("fit_scale", 1.0)
-                STATE["displayed_frame_id"] = frame["frame_id"]
-                STATE["last_n"] = len(pts)
-                if gpu_ok:
-                    STATE["last_error"] = ""
-                else:
-                    STATE["last_error"] = "; ".join(
-                        err for err in (gpu_error, pointcloud_error) if err
-                    )[:160]
-
+        if frame is None or frame["frame_id"] == displayed_frame_id:
             return 0.016
 
-        obj = ensure_pointcloud_object()
-        with STATE["lock"]:
-            pts = STATE["points"]
+        pts = frame["points"]
+        set_pointcloud_data(obj, pts, radius=STATE["point_radius"])
 
-        if pts:
-            set_pointcloud_data(obj, pts, radius=STATE["point_radius"])
-            with STATE["lock"]:
-                STATE["last_error"] = ""
-    except Exception as exc:
+        obbs = frame["obbs"]
+        if obbs:
+            set_obb_from_corners(bbox_obj, obbs[0]["corners"])
+
         with STATE["lock"]:
-            STATE["last_error"] = f"{type(exc).__name__}: {exc}"[:160]
-        return 0.25
+            STATE["points"] = pts
+            STATE["colors"] = frame["colors"]
+            STATE["obbs"] = obbs
+            STATE["displayed_frame_id"] = frame["frame_id"]
+            STATE["last_n"] = len(pts)
+
+        return 0.016
+
+    with STATE["lock"]:
+        pts = STATE["points"]
+
+    if pts:
+        set_pointcloud_data(obj, pts, radius=STATE["point_radius"])
 
     return 0.05
 
@@ -989,15 +551,9 @@ class BLAZE_OT_start(bpy.types.Operator):
         STATE["last_n"] = 0
         STATE["last_latency_ms"] = 0.0
         STATE["dropped_frames"] = 0
-        STATE["last_error"] = ""
         STATE["points"] = []
         STATE["colors"] = None
         STATE["obbs"] = []
-        STATE["label_items"] = []
-        STATE["fit_center"] = None
-        STATE["fit_scale"] = 1.0
-        STATE["gpu_batch"] = None
-        STATE["gpu_point_count"] = 0
         STATE["running"] = True
         threading.Thread(target=recv_stream_thread, daemon=True).start()
         bpy.app.timers.register(timer_update)
@@ -1019,17 +575,10 @@ class BLAZE_OT_start_v2(bpy.types.Operator):
         STATE["last_n"] = 0
         STATE["last_latency_ms"] = 0.0
         STATE["dropped_frames"] = 0
-        STATE["last_error"] = ""
         STATE["points"] = []
         STATE["colors"] = None
         STATE["obbs"] = []
-        STATE["label_items"] = []
-        STATE["fit_center"] = None
-        STATE["fit_scale"] = 1.0
-        STATE["gpu_batch"] = None
-        STATE["gpu_point_count"] = 0
         STATE["running"] = True
-        ensure_draw_handler()
         threading.Thread(target=recv_stream_v2_thread, daemon=True).start()
         bpy.app.timers.register(timer_update)
         self.report({'INFO'}, "Blaze v2 realtime stream started")
@@ -1042,7 +591,6 @@ class BLAZE_OT_stop(bpy.types.Operator):
 
     def execute(self, context):
         STATE["running"] = False
-        remove_draw_handler()
         self.report({'INFO'}, "Blaze stream stopped")
         return {'FINISHED'}
 
@@ -1090,20 +638,13 @@ class BLAZE_OT_pick(bpy.types.Operator):
         if best_p is None:
             return {'CANCELLED'}
 
-        rpc_point = display_to_source_point(best_p)
-        corners, label = rpc_click(rpc_point)
+        corners, label = rpc_click(best_p)
         if corners is None:
             self.report({'ERROR'}, f"RPC: {label}")
             return {'CANCELLED'}
 
         bbox_obj = ensure_bbox_object()
         set_bbox_from_corners(bbox_obj, corners)
-        with STATE["lock"]:
-            STATE["label_items"] = [{
-                "pos": tuple(corners[4]),
-                "text": label,
-                "index": 0,
-            }]
         self.report({'INFO'}, f"Label: {label}")
         return {'FINISHED'}
 
@@ -1130,8 +671,6 @@ class BLAZE_PT_panel(bpy.types.Panel):
         layout.label(text=f"Frame: {STATE['displayed_frame_id']}")
         layout.label(text=f"Latency: {STATE['last_latency_ms']:.1f} ms")
         layout.label(text=f"Dropped: {STATE['dropped_frames']}")
-        if STATE["last_error"]:
-            layout.label(text=f"Error: {STATE['last_error']}", icon='ERROR')
         layout.label(text="Ajuste rápido:")
         layout.prop(context.scene, "blaze_point_radius")
         layout.prop(context.scene, "blaze_target_size")
@@ -1166,8 +705,6 @@ def register():
         bpy.utils.register_class(c)
 
 def unregister():
-    STATE["running"] = False
-    remove_draw_handler()
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
     del bpy.types.Scene.blaze_point_radius
