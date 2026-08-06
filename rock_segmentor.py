@@ -46,6 +46,22 @@ class RockCluster:
     tracking_status: str = "selected"
     match_distance: float = 0.0
 
+    @property
+    def length(self) -> float:
+        return float(max(self.obb_extent[0], self.obb_extent[1]))
+
+    @property
+    def width(self) -> float:
+        return float(min(self.obb_extent[0], self.obb_extent[1]))
+
+    @property
+    def height(self) -> float:
+        return float(self.height_above_ground)
+
+    @property
+    def dimensions_lwh(self) -> np.ndarray:
+        return np.array([self.length, self.width, self.height], dtype=np.float32)
+
 
 @dataclass
 class SegResult:
@@ -92,11 +108,12 @@ class SegConfig:
     tracking_enabled: bool = True
     track_max_center_jump: float = 0.35
     track_max_extent_ratio: float = 2.5
+    track_dimension_tolerance: float = 0.10
     track_hold_frames: int = 90
 
     # Priors geometricos para preferir rocas y penalizar intrusos largos/altos
     rock_min_height: float = 0.03
-    rock_max_height: float = 1.30
+    rock_max_height: float = 0.50
     rock_max_aspect: float = 12.0
     rock_max_footprint: float = 2.50
 
@@ -121,6 +138,7 @@ class RockSegmentor:
         self._clf    = None
         self._scaler = None
         self._last_cluster: Optional[RockCluster] = None
+        self._target_dimensions_lwh: Optional[np.ndarray] = None
         self._missed_track_frames = 0
         self._load_model()
 
@@ -469,16 +487,30 @@ class RockSegmentor:
             self._missed_track_frames = 0
             return None, "lost"
 
+        eligible = (
+            self._dimension_compatible_candidates(candidates)
+            if cfg.tracking_enabled
+            else candidates
+        )
+        if not eligible:
+            if self._last_cluster is not None and self._should_hold_track():
+                return self._hold_last_cluster(), "hold"
+            self._last_cluster = None
+            self._missed_track_frames = 0
+            return None, "lost_size"
+
         if not cfg.tracking_enabled or self._last_cluster is None:
-            selected = max(candidates, key=lambda c: c.candidate_score)
-            self._commit_track(selected, "init")
-            return selected, "init"
+            selected = max(eligible, key=lambda c: c.candidate_score)
+            status = "reacquired" if self._target_dimensions_lwh is not None else "init"
+            self._commit_track(selected, status)
+            return selected, status
 
         prev = self._last_cluster
         matches: list[Tuple[float, RockCluster]] = []
-        for candidate in candidates:
+        for candidate in eligible:
             center_dist = float(np.linalg.norm(candidate.base_center - prev.base_center))
-            extent_ratio = self._max_extent_ratio(candidate.obb_extent, prev.obb_extent)
+            extent_ratio = self._max_extent_ratio(candidate.dimensions_lwh, prev.dimensions_lwh)
+            dimension_delta = self._dimension_delta_lwh(candidate)
             candidate.match_distance = center_dist
 
             if center_dist > cfg.track_max_center_jump:
@@ -490,6 +522,7 @@ class RockSegmentor:
                 candidate.candidate_score
                 - 6.0 * (center_dist / max(cfg.track_max_center_jump, 1e-6))
                 - 2.0 * np.log(max(extent_ratio, 1.0))
+                - 2.0 * float(np.sum(dimension_delta) / max(cfg.track_dimension_tolerance, 1e-6))
             )
             matches.append((float(tracking_score), candidate))
 
@@ -501,14 +534,54 @@ class RockSegmentor:
         if self._should_hold_track():
             return self._hold_last_cluster(), "hold"
 
-        selected = max(candidates, key=lambda c: c.candidate_score)
+        selected = max(eligible, key=lambda c: c.candidate_score)
         self._commit_track(selected, "reacquired")
         return selected, "reacquired"
 
     def _commit_track(self, cluster: RockCluster, status: str) -> None:
         cluster.tracking_status = status
         self._last_cluster = cluster
+        if self.cfg.tracking_enabled and self._target_dimensions_lwh is None:
+            self._target_dimensions_lwh = cluster.dimensions_lwh.copy()
         self._missed_track_frames = 0
+
+    def _dimension_reference_lwh(self) -> Optional[np.ndarray]:
+        if self._target_dimensions_lwh is not None:
+            return self._target_dimensions_lwh
+        if self._last_cluster is not None:
+            return self._last_cluster.dimensions_lwh
+        return None
+
+    def _dimension_delta_lwh(self, candidate: RockCluster) -> np.ndarray:
+        ref = self._dimension_reference_lwh()
+        if ref is None:
+            return np.zeros(3, dtype=np.float32)
+        return np.abs(candidate.dimensions_lwh - ref.astype(np.float32))
+
+    def _dimension_compatible_candidates(
+        self,
+        candidates: List[RockCluster],
+    ) -> List[RockCluster]:
+        ref = self._dimension_reference_lwh()
+        if ref is None:
+            return candidates
+
+        tol = self.cfg.track_dimension_tolerance
+        compatible: List[RockCluster] = []
+        for candidate in candidates:
+            delta = np.abs(candidate.dimensions_lwh - ref.astype(np.float32))
+            if np.all(delta <= tol):
+                compatible.append(candidate)
+            else:
+                log.debug(
+                    "Tracking reject LWH cid=%d ref=%s cand=%s delta=%s tol=%.3f",
+                    candidate.cluster_id,
+                    np.round(ref, 3).tolist(),
+                    np.round(candidate.dimensions_lwh, 3).tolist(),
+                    np.round(delta, 3).tolist(),
+                    tol,
+                )
+        return compatible
 
     def _should_hold_track(self) -> bool:
         self._missed_track_frames += 1

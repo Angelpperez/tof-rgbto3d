@@ -60,7 +60,9 @@ OBB_EDGES = [
     (0, 4), (1, 5), (2, 6), (3, 7),
 ]
 
-SEG_EVERY = 5   # corre segmentación cada N frames capturados
+SEG_EVERY = 5     # corre segmentacion cada N frames capturados reales
+SEG_STRIDE = 3    # submuestreo espacial para segmentacion
+RENDER_STRIDE = 2 # submuestreo espacial para render en vivo
 
 SEG_CFG = SegConfig(
     conf_min         = 200,
@@ -88,6 +90,8 @@ LATEST: dict = {
     "conf": None,       # (H,W) uint16
     "intens": None,     # (H,W) uint16
     "seg":  None,       # SegResult
+    "frame_id": 0,      # incrementa una vez por frame capturado
+    "seg_frame_id": 0,  # frame_id usado por la ultima segmentacion
     "lock": threading.Lock(),
     "stop": False,
 }
@@ -122,11 +126,26 @@ def _flip_y(pts: np.ndarray) -> np.ndarray:
     return out
 
 
-def _build_raw_cloud(xyz_hw3: np.ndarray, scale=0.001) -> np.ndarray:
+def _build_raw_cloud(xyz_hw3: np.ndarray, scale=0.001, stride: int = 1) -> np.ndarray:
     """Nube cruda (sin segmentación) para visualizar el frame en vivo."""
+    if stride > 1:
+        xyz_hw3 = xyz_hw3[::stride, ::stride, :]
     pts = xyz_hw3.reshape(-1, 3).astype(np.float32) * scale
     valid = np.isfinite(pts).all(axis=1) & (np.linalg.norm(pts, axis=1) > 1e-4)
     return _flip_y(pts[valid])
+
+
+def _downsample_frame(
+    xyz: np.ndarray,
+    conf: np.ndarray | None,
+    intens: np.ndarray | None,
+    stride: int,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    if stride <= 1:
+        return xyz, conf, intens
+    conf_ds = conf[::stride, ::stride] if conf is not None else None
+    intens_ds = intens[::stride, ::stride] if intens is not None else None
+    return xyz[::stride, ::stride, :], conf_ds, intens_ds
 
 
 def _build_seg_cloud(result: SegResult):
@@ -436,6 +455,7 @@ def capture_loop(cam) -> None:
                 LATEST["xyz"]   = xyz.astype(np.float32)
                 LATEST["conf"]  = conf
                 LATEST["intens"] = intensity
+                LATEST["frame_id"] += 1
 
             frame_cnt += 1
         except Exception as e:
@@ -450,8 +470,7 @@ def capture_loop(cam) -> None:
 # ---------------------------------------------------------------------------
 
 def seg_loop(segmentor: RockSegmentor) -> None:
-    frame_seen = 0
-    seg_frame  = 0
+    last_processed_frame_id = -SEG_EVERY
     simulink_sender = SimulinkUdpSender.from_env()
 
     while not LATEST["stop"]:
@@ -459,18 +478,22 @@ def seg_loop(segmentor: RockSegmentor) -> None:
             xyz   = LATEST["xyz"]
             conf  = LATEST["conf"]
             intens = LATEST["intens"]
+            frame_id = LATEST["frame_id"]
 
         if xyz is None:
             time.sleep(0.01)
             continue
 
-        # Throttle: solo cada SEG_EVERY veces que hay un frame nuevo
-        frame_seen += 1
-        if frame_seen % SEG_EVERY != 0:
+        # Procesa frames reales, sin cola: si se atrasa, toma el ultimo disponible.
+        if frame_id == last_processed_frame_id or frame_id - last_processed_frame_id < SEG_EVERY:
             time.sleep(0.005)
             continue
 
-        result = segmentor.process(xyz, conf, intens)
+        seg_xyz, seg_conf, seg_intens = _downsample_frame(xyz, conf, intens, SEG_STRIDE)
+        source_frame_id = frame_id
+
+        result = segmentor.process(seg_xyz, seg_conf, seg_intens)
+        last_processed_frame_id = source_frame_id
         if result.clusters:
             main_cluster = result.clusters[0]
             top_xyz = _fmt_xyz(main_cluster.top_face_center)
@@ -478,12 +501,14 @@ def seg_loop(segmentor: RockSegmentor) -> None:
         else:
             top_xyz = "-"
 
-        log.info("[SEG] prob=%.3f | rock=%s | clusters=%d | track=%s | top_xyz_cam=%s | %.0fms",
+        log.info("[SEG] frame=%d stride=%d | prob=%.3f | rock=%s | clusters=%d | track=%s | top_xyz_cam=%s | %.0fms",
+                 source_frame_id, SEG_STRIDE,
                  result.prob_roca, result.is_rock, len(result.clusters),
                  result.tracking_status, top_xyz, result.elapsed_ms)
 
         with LATEST["lock"]:
             LATEST["seg"] = result
+            LATEST["seg_frame_id"] = source_frame_id
 
 # ---------------------------------------------------------------------------
 # Main — Open3D visualizer (hilo principal, obligatorio en Windows)
@@ -501,6 +526,7 @@ def _offline_loop(npz_paths: list) -> None:
             LATEST["xyz"]    = data["xyz"].astype(np.float32)
             LATEST["conf"]   = data.get("confidence")
             LATEST["intens"] = data.get("intensity")
+            LATEST["frame_id"] += 1
         idx += 1
         time.sleep(0.1)   # ~10fps simulado
 
@@ -515,6 +541,8 @@ def _latest_api_status() -> dict:
         return {
             "source": "offline" if LATEST.get("offline") else "camera",
             "has_frame": LATEST["xyz"] is not None,
+            "frame_id": LATEST["frame_id"],
+            "seg_frame_id": LATEST["seg_frame_id"],
         }
 
 
@@ -592,9 +620,13 @@ def main(
     opt.background_color  = np.array([0.05, 0.05, 0.05])
     opt.show_coordinate_frame = True
 
-    # Nube principal
+    # Nube principal: frame crudo en vivo.
     pcd = o3d.geometry.PointCloud()
     vis.add_geometry(pcd)
+
+    # Overlay semantico: suelo/objeto coloreados desde la ultima segmentacion.
+    semantic_pcd = o3d.geometry.PointCloud()
+    vis.add_geometry(semantic_pcd)
 
     # OBBs activos en el visualizador
     active_obbs: list = []
@@ -602,15 +634,14 @@ def main(
 
     first_reset  = True
     last_seg_ts  = 0.0
-    # Cache de última nube segmentada — evita el flash entre segmentaciones
-    cached_pts: np.ndarray | None = None
-    cached_cols: np.ndarray | None = None
+    last_render_frame_id = -1
 
     try:
         while True:
             with LATEST["lock"]:
                 xyz = LATEST["xyz"]
                 seg = LATEST["seg"]
+                frame_id = LATEST["frame_id"]
 
             if xyz is None:
                 time.sleep(0.01)
@@ -620,31 +651,29 @@ def main(
                 continue
 
             seg_changed = seg is not None and seg.timestamp > last_seg_ts
+            raw_changed = frame_id != last_render_frame_id
 
-            # --- Actualizar nube de puntos ---
-            if seg_changed:
-                # Nueva segmentación: calcular y guardar en caché
-                cached_pts, cached_cols = _build_seg_cloud(seg)
-                last_seg_ts = seg.timestamp
+            # --- Actualizar nube cruda en vivo ---
+            if raw_changed:
+                pts  = _build_raw_cloud(xyz, scale=SEG_CFG.xyz_scale, stride=RENDER_STRIDE)
+                cols = np.tile(COLOR_GROUND, (pts.shape[0], 1))
 
-            if cached_pts is not None:
-                # Mostrar última nube segmentada (sin flash)
-                pts, cols = cached_pts, cached_cols
-            else:
-                # Antes de la primera segmentación: nube cruda azul
-                pts  = _build_raw_cloud(xyz, scale=SEG_CFG.xyz_scale)
-                cols = np.tile([0.4, 0.6, 0.8], (pts.shape[0], 1))
-
-            if pts.shape[0] > 0:
                 pcd.points = o3d.utility.Vector3dVector(pts)
                 pcd.colors = o3d.utility.Vector3dVector(cols)
                 vis.update_geometry(pcd)
-                if first_reset:
+                last_render_frame_id = frame_id
+                if first_reset and pts.shape[0] > 0:
                     vis.reset_view_point(True)
                     first_reset = False
 
             # --- Actualizar OBBs solo cuando hay segmentación nueva ---
             if seg_changed:
+                last_seg_ts = seg.timestamp
+                seg_pts, seg_cols = _build_seg_cloud(seg)
+                semantic_pcd.points = o3d.utility.Vector3dVector(seg_pts)
+                semantic_pcd.colors = o3d.utility.Vector3dVector(seg_cols)
+                vis.update_geometry(semantic_pcd)
+
                 for obb in active_obbs:
                     vis.remove_geometry(obb, reset_bounding_box=False)
                 active_obbs.clear()
@@ -671,7 +700,7 @@ def main(
 
                         rock_label_origin = top_point + np.array([0.18, 0.16, 0.05])
                         rock_label = _make_text_label(
-                            "ROCK",
+                            "ROCA",
                             rock_label_origin,
                             scale=label_scale * 0.95,
                             color=tuple(COLOR_LABEL),

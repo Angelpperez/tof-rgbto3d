@@ -40,7 +40,8 @@ TCP_RPC_PORT = 6006
 
 STRIDE      = 4      # downsample para UDP (sube si va lento)
 CONF_MIN    = 0      # filtro de confianza para UDP
-SEG_EVERY   = 5      # correr segmentación cada N frames capturados
+SEG_EVERY   = 5      # correr segmentacion cada N frames capturados reales
+SEG_STRIDE  = 3      # submuestreo espacial para segmentacion
 
 SEG_CFG = SegConfig(
     conf_min         = 200,
@@ -70,6 +71,8 @@ LATEST = {
     "conf":      None,     # (H,W) uint16
     "intensity": None,     # (H,W) uint16
     "seg":       None,     # SegResult o None
+    "frame_id":  0,        # incrementa una vez por frame capturado
+    "seg_frame_id": 0,     # frame_id usado por la ultima segmentacion
     "lock":      threading.Lock(),
 }
 
@@ -91,6 +94,8 @@ def _latest_api_status() -> dict:
         return {
             "source": "camera-server",
             "has_frame": LATEST["xyz"] is not None,
+            "frame_id": LATEST["frame_id"],
+            "seg_frame_id": LATEST["seg_frame_id"],
         }
 
 
@@ -161,6 +166,14 @@ def build_points(xyz, depth_bgr, conf=None, stride=4, conf_min=0):
         valid &= (conf[::stride, ::stride].reshape(-1) >= conf_min)
 
     return pts[valid], cols[valid]
+
+
+def downsample_frame(xyz, conf, intens, stride):
+    if stride <= 1:
+        return xyz, conf, intens
+    conf_ds = conf[::stride, ::stride] if conf is not None else None
+    intens_ds = intens[::stride, ::stride] if intens is not None else None
+    return xyz[::stride, ::stride, :], conf_ds, intens_ds
 
 
 def _fmt_xyz(point: np.ndarray) -> str:
@@ -236,6 +249,7 @@ def capture_loop() -> None:
                 LATEST["depth_bgr"] = depth_bgr
                 LATEST["conf"]      = conf
                 LATEST["intensity"] = intensity
+                LATEST["frame_id"] += 1
 
         finally:
             grab.Release()
@@ -247,24 +261,29 @@ def capture_loop() -> None:
 def segmentation_loop() -> None:
     segmentor  = RockSegmentor(SEG_CFG)
     simulink_sender = SimulinkUdpSender.from_env()
-    frame_cnt  = 0
+    last_processed_frame_id = -SEG_EVERY
 
     while True:
         with LATEST["lock"]:
             xyz  = LATEST["xyz"]
             conf = LATEST["conf"]
             intens = LATEST["intensity"]
+            frame_id = LATEST["frame_id"]
 
         if xyz is None:
             time.sleep(0.01)
             continue
 
-        frame_cnt += 1
-        if frame_cnt % SEG_EVERY != 0:
+        # Procesa frames reales, sin cola: si se atrasa, toma el ultimo disponible.
+        if frame_id == last_processed_frame_id or frame_id - last_processed_frame_id < SEG_EVERY:
             time.sleep(0.005)
             continue
 
-        result = segmentor.process(xyz, conf, intens)
+        seg_xyz, seg_conf, seg_intens = downsample_frame(xyz, conf, intens, SEG_STRIDE)
+        source_frame_id = frame_id
+
+        result = segmentor.process(seg_xyz, seg_conf, seg_intens)
+        last_processed_frame_id = source_frame_id
         if result.clusters:
             main_cluster = result.clusters[0]
             top_xyz = _fmt_xyz(main_cluster.top_face_center)
@@ -273,13 +292,15 @@ def segmentation_loop() -> None:
             top_xyz = "-"
 
         log.info(
-            "[SEG] prob_roca=%.3f | is_rock=%s | clusters=%d | track=%s | top_xyz_cam=%s | %.1f ms",
+            "[SEG] frame=%d stride=%d | prob_roca=%.3f | is_rock=%s | clusters=%d | track=%s | top_xyz_cam=%s | %.1f ms",
+            source_frame_id, SEG_STRIDE,
             result.prob_roca, result.is_rock, len(result.clusters),
             result.tracking_status, top_xyz, result.elapsed_ms
         )
 
         with LATEST["lock"]:
             LATEST["seg"] = result
+            LATEST["seg_frame_id"] = source_frame_id
 
 # ---------------------------------------------------------------------------
 # udp_stream_loop — nube coloreada + OBBs de rocas
